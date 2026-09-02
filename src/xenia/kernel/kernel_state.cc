@@ -540,7 +540,8 @@ X_RESULT KernelState::FinishLoadingUserModule(
     module->xex_module()->Precompile();
   }
 
-  if (module->is_dll_module() && module->entry_point() && call_entry) {
+  if (module->is_dll_module() && module->entry_point() && call_entry &&
+      !module->has_synthetic_entry_point()) {
     // Call DllMain(DLL_PROCESS_ATTACH):
     // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
     uint64_t args[] = {
@@ -705,7 +706,8 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
                                    bool call_entry) {
   auto global_lock = global_critical_region_.Acquire();
 
-  if (module->is_dll_module() && module->entry_point() && call_entry) {
+  if (module->is_dll_module() && module->entry_point() && call_entry &&
+      !module->has_synthetic_entry_point()) {
     // Call DllMain(DLL_PROCESS_DETACH):
     // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
     uint64_t args[] = {
@@ -783,7 +785,7 @@ void KernelState::TerminateTitle() {
     X_STATUS status = user_modules_[i]->Unload();
     assert_true(XSUCCEEDED(status));
 
-    object_table_.RemoveHandle(user_modules_[i]->handle());
+    object_table_.ForceRemoveHandle(user_modules_[i]->handle());
   }
   user_modules_.clear();
 
@@ -798,6 +800,18 @@ void KernelState::TerminateTitle() {
 
   // Unset the executable module.
   executable_module_ = nullptr;
+
+  // Every other guest thread has been stepped to a safe point and
+  // terminated above, and all modules are unloaded, so it's now safe to
+  // dispatch a pending title transition (see
+  // Emulator::SetPendingLaunchContinuation) without racing a leftover
+  // thread from the outgoing title.
+  if (auto continuation = emulator_->TakePendingLaunchContinuation()) {
+    auto display_window = emulator_->display_window();
+    if (display_window) {
+      display_window->app_context().CallInUIThread(std::move(continuation));
+    }
+  }
 
   if (XThread::IsInThread()) {
     threads_by_id_.erase(XThread::GetCurrentThread()->thread_id());
@@ -832,7 +846,8 @@ void KernelState::OnThreadExecute(XThread* thread) {
   // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
   auto thread_state = thread->thread_state();
   for (auto user_module : user_modules_) {
-    if (user_module->is_dll_module() && user_module->entry_point()) {
+    if (user_module->is_dll_module() && user_module->entry_point() &&
+        !user_module->has_synthetic_entry_point()) {
       uint64_t args[] = {
           user_module->handle(),
           2,  // DLL_THREAD_ATTACH
@@ -854,7 +869,8 @@ void KernelState::OnThreadExit(XThread* thread) {
   // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
   auto thread_state = thread->thread_state();
   for (auto user_module : user_modules_) {
-    if (user_module->is_dll_module() && user_module->entry_point()) {
+    if (user_module->is_dll_module() && user_module->entry_point() &&
+        !user_module->has_synthetic_entry_point()) {
       uint64_t args[] = {
           user_module->handle(),
           3,  // DLL_THREAD_DETACH

@@ -1003,8 +1003,19 @@ bool Processor::StepToGuestAddress(uint32_t thread_id, uint32_t pc) {
     thread_info->thread->thread()->Resume(&suspend_count);
   }
 
-  fence.Wait();
+  // Bounded wait: if the target thread never reaches pc (e.g. it's parked in
+  // a blocking host call and isn't executing guest code at all), don't hang
+  // forever - callers (e.g. KernelState::TerminateTitle) suspend/terminate
+  // the thread regardless of whether this step actually landed.
+  bool reached_pc = fence.Wait(std::chrono::milliseconds(2000));
   bp.Suspend();
+  if (!reached_pc) {
+    XELOGW(
+        "Processor::StepToGuestAddress: timed out waiting for thread {} to "
+        "reach {:08X}; giving up on the safe-point step.",
+        thread_id, pc);
+    return false;
+  }
 
   return true;
 }
@@ -1073,7 +1084,17 @@ uint32_t Processor::StepIntoGuestBranchTarget(uint32_t thread_id, uint32_t pc) {
       thread->thread()->Resume(&suspend_count);
     }
 
-    fence.Wait();
+    // Bounded wait: same reasoning as StepToGuestAddress() - if the target
+    // thread never reaches either breakpoint (e.g. it's parked in a
+    // blocking host call and isn't executing guest code at all), don't hang
+    // forever.
+    if (!fence.Wait(std::chrono::milliseconds(2000))) {
+      XELOGW(
+          "Processor::StepIntoGuestBranchTarget: timed out waiting for "
+          "thread {} to reach a branch target from {:08X}; giving up on the "
+          "safe-point step.",
+          thread_id, pc);
+    }
     bpt.Suspend();
     bpf.Suspend();
   }

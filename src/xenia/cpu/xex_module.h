@@ -170,6 +170,22 @@ class XexModule : public xe::cpu::Module {
   const uint32_t base_address() const { return base_address_; }
   const bool is_dev_kit() const { return is_dev_kit_; }
 
+  // Entry point leído directamente del optional header del PE embebido
+  // (AddressOfEntryPoint). Sirve de respaldo para módulos que no traen
+  // XEX_HEADER_ENTRY_POINT (visto en binarios de sistema de la flash/NAND,
+  // como bootanim).
+  uint32_t pe_entry_point() const { return pe_entry_point_; }
+
+  // True when pe_entry_point() itself had to be guessed from the module's
+  // lowest export ordinal (no XEX_HEADER_ENTRY_POINT and no PE
+  // AddressOfEntryPoint either). That address is not a real DllMain: it
+  // doesn't take a dwReason argument, so callers must not invoke it for
+  // DLL_PROCESS_ATTACH/DLL_THREAD_ATTACH/DLL_THREAD_DETACH notifications -
+  // only as the module's one-shot "main" entry point.
+  bool used_export_ordinal_fallback() const {
+    return used_export_ordinal_fallback_;
+  }
+
   // Gets an optional header. Returns NULL if not found.
   // Special case: if key & 0xFF == 0x00, this function will return the value,
   // not a pointer! This assumes out_ptr points to uint32_t.
@@ -276,6 +292,8 @@ class XexModule : public xe::cpu::Module {
   bool finished_load_ = false;  // PE/imports/symbols/etc all loaded?
 
   uint32_t base_address_ = 0;
+  uint32_t pe_entry_point_ = 0;
+  bool used_export_ordinal_fallback_ = false;
   uint32_t low_address_ = 0;
   uint32_t high_address_ = 0;
 

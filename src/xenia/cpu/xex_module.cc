@@ -854,6 +854,34 @@ int XexModule::ReadPEHeaders() {
     return 1;
   }
 
+  // Respaldo: algunos módulos de sistema (bootanim de la flash, por ejemplo)
+  // no traen XEX_HEADER_ENTRY_POINT. Guardamos el entry point del propio PE.
+  pe_entry_point_ = base_address_ + opthdr->AddressOfEntryPoint;
+
+  // Some system modules (bootanim.xex, confirmed by dumping its own export
+  // table) are pure export libraries with AddressOfEntryPoint == 0 - a
+  // standard PE convention meaning "no initialization code, call an export
+  // directly instead". For those, fall back to the module's own lowest
+  // ordinal export as the closest thing to a "start" routine, instead of
+  // pointing at the raw image base (which is just header bytes, not code).
+  if (!opthdr->AddressOfEntryPoint && xex_security_info()->export_table) {
+    auto export_table = memory()->TranslateVirtual<const xex2_export_table*>(
+        xex_security_info()->export_table);
+    if (export_table->count) {
+      uint32_t addr = export_table->ordOffset[0];
+      addr += (uint32_t)export_table->imagebaseaddr << 16;
+      XELOGW(
+          "Module {} has AddressOfEntryPoint == 0; falling back to its "
+          "lowest export ordinal ({:04X}) at {:08X} as a start routine.",
+          name(), (uint32_t)export_table->base, addr);
+      pe_entry_point_ = addr;
+      // This isn't a real DllMain - it doesn't take a dwReason argument and
+      // has no idea it's being asked to handle DLL_THREAD_ATTACH/DETACH, so
+      // callers must not invoke it that way (see used_export_ordinal_fallback()).
+      used_export_ordinal_fallback_ = true;
+    }
+  }
+
 // Linker version - likely 8+
 // Could be useful for recognizing certain patterns
 // opthdr->MajorLinkerVersion; opthdr->MinorLinkerVersion;

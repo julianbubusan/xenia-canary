@@ -691,6 +691,9 @@ bool EmulatorWindow::Initialize() {
     file_menu->AddChild(
         MenuItem::Create(MenuItem::Type::kString, "Close",
                          std::bind(&EmulatorWindow::FileClose, this)));
+    file_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "Continue to dash.xex (skip boot anim)", "",
+        std::bind(&EmulatorWindow::ContinueToModule, this, "dash.xex")));
 #endif  // #ifdef DEBUG
     file_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
     file_menu->AddChild(MenuItem::Create(
@@ -1158,6 +1161,19 @@ void EmulatorWindow::FileOpen() {
 }
 
 void EmulatorWindow::FileClose() { emulator_->TerminateTitle(); }
+
+void EmulatorWindow::ContinueToModule(const std::string& relative_path) {
+  auto xam = emulator_->kernel_state()
+                ->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+  auto& loader_data = xam->loader_data();
+  loader_data.launch_path = relative_path;
+  loader_data.launch_data_present = true;
+
+  auto emulator = emulator_;
+  emulator->SetPendingLaunchContinuation(
+      [emulator]() { emulator->ContinuePendingLaunch(); });
+  emulator->TerminateTitle();
+}
 
 void EmulatorWindow::InstallContent() {
   std::vector<std::filesystem::path> paths;

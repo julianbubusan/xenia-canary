@@ -68,6 +68,13 @@ class UserModule : public XModule {
   bool is_dll_module() const { return is_dll_module_; }
 
   uint32_t entry_point() const { return entry_point_; }
+  // True when entry_point() was guessed from the module's own lowest export
+  // ordinal rather than a real entry point (see
+  // XexModule::used_export_ordinal_fallback()). Not a real DllMain, so
+  // callers must not invoke it for DLL_*_ATTACH/DETACH notifications.
+  bool has_synthetic_entry_point() const {
+    return xex_module() && xex_module()->used_export_ordinal_fallback();
+  }
   uint32_t stack_size() const { return stack_size_; }
   uint32_t workspace_size() const { return workspace_size_; }
 

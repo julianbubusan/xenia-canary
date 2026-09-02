@@ -244,6 +244,17 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
   return X_STATUS_SUCCESS;
 }
 
+X_STATUS ObjectTable::ForceRemoveHandle(X_HANDLE handle) {
+  auto global_lock = global_critical_region_.Acquire();
+
+  ObjectTableEntry* entry = LookupTableInLock(TranslateHandle(handle));
+  if (entry) {
+    entry->handle_ref_count = 0;
+  }
+
+  return RemoveHandle(handle);
+}
+
 std::vector<object_ref<XObject>> ObjectTable::GetAllObjects() {
   auto lock = global_critical_region_.Acquire();
   std::vector<object_ref<XObject>> results;
@@ -274,6 +285,13 @@ void ObjectTable::PurgeAllObjects() {
     auto& entry = table_[slot];
     if (entry.object) {
       entry.handle_ref_count = 0;
+      // Unlike RemoveHandle(), this wipes every table slot in one pass, so a
+      // single object may still be pointed to by slots we haven't reached
+      // yet. Drop its handle bookkeeping now (idempotent - later slots
+      // pointing to the same object just clear an already-empty list)
+      // instead of leaving stale entries that trip the handles_.empty()
+      // assert in XObject's destructor once Release() drops it to 0 refs.
+      entry.object->handles().clear();
       entry.object->Release();
 
       entry.object = nullptr;

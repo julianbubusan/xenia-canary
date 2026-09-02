@@ -217,7 +217,18 @@ X_STATUS UserModule::LoadContinue() {
   std::memcpy(xex_header_ptr, header, header->header_size);
 
   // Cache some commonly used headers...
-  this->xex_module()->GetOptHeader(XEX_HEADER_ENTRY_POINT, &entry_point_);
+  if (!this->xex_module()->GetOptHeader(XEX_HEADER_ENTRY_POINT,
+                                         &entry_point_) ||
+      !entry_point_) {
+    uint32_t pe_entry = this->xex_module()->pe_entry_point();
+    if (pe_entry) {
+      XELOGW(
+          "Module {} has no XEX_HEADER_ENTRY_POINT; falling back to PE "
+          "entry point {:08X}",
+          name(), pe_entry);
+      entry_point_ = pe_entry;
+    }
+  }
   this->xex_module()->GetOptHeader(XEX_HEADER_DEFAULT_STACK_SIZE, &stack_size_);
 
   xe::be<uint32_t>* ws_size = 0;

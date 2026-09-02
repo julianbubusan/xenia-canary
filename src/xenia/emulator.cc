@@ -647,6 +647,17 @@ X_STATUS Emulator::LaunchDefaultModule(const std::filesystem::path& path) {
   return result;
 }
 
+X_STATUS Emulator::ContinuePendingLaunch() {
+  // Cleans the GPU state of the outgoing title before CompleteLaunch()
+  // initializes the shader storage of the new title.
+  if (graphics_system_) {
+    graphics_system_->ClearCaches();
+  }
+
+  std::string module_path = FindLaunchModule();
+  return CompleteLaunch(std::filesystem::path(), module_path);
+}
+  
 X_STATUS Emulator::DataMigration(const uint64_t xuid) {
   uint32_t failure_count = 0;
   const std::string xuid_string = fmt::format("{:016X}", xuid);
@@ -1464,7 +1475,13 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     return result;
   }
 
-  result = kernel_state_->FinishLoadingUserModule(module);
+  // call_entry=false: this is the title module, whose entry point runs via
+  // the guest main thread created below by LaunchModule(), not via a
+  // synchronous DllMain call here (there is no guest thread yet). Some
+  // system modules (e.g. bootanim.xex) carry both XEX_MODULE_TITLE and
+  // XEX_MODULE_DLL_MODULE flags, which would otherwise trigger the DllMain
+  // path in FinishLoadingUserModule() before any guest thread exists.
+  result = kernel_state_->FinishLoadingUserModule(module, false);
   if (XFAILED(result)) {
     XELOGE("Failed to initialize user module {}", path);
     return result;

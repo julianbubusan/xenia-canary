@@ -237,6 +237,11 @@ class EmulatorWindow {
   void OnMouseUp(const ui::MouseEvent& e);
   void FileOpen();
   void FileClose();
+  // Debug helper: manually hands off from the currently-running module (e.g.
+  // a boot animation that has no code path of its own to request this) to
+  // another module in the same host folder, in the same window/process -
+  // reuses the same XamLoaderLaunchTitle machinery a title would use.
+  void ContinueToModule(const std::string& relative_path);
   void InstallContent();
   void ExtractZarchive();
   void CreateZarchive();

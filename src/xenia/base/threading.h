@@ -75,6 +75,41 @@ class Fence {
     }
   }
 
+  // Bounded version of Wait(). Returns false if the timeout elapses without
+  // the Fence being signaled (e.g. the thread it's tied to never reaches the
+  // expected point, such as being stuck in a blocking host call), instead of
+  // waiting forever.
+  bool Wait(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    assert_true((signal_state_ & ~SIGMASK_) < (SIGMASK_ - 1) &&
+                "Too many threads?");
+
+    auto signal_state = ++signal_state_;
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!(signal_state & SIGMASK_)) {
+      if (cond_.wait_until(lock, deadline) == std::cv_status::timeout) {
+        signal_state = signal_state_;
+        if (!(signal_state & SIGMASK_)) {
+          // Never got signaled - remove ourselves from the waiter count and
+          // give up instead of blocking indefinitely.
+          --signal_state_;
+          return false;
+        }
+        break;
+      }
+      signal_state = signal_state_;
+    }
+
+    // Same bookkeeping as the unbounded Wait().
+    assert_true((signal_state & ~SIGMASK_) > 0);
+    if (signal_state == (1 | SIGMASK_)) {
+      signal_state_ = 0;
+    } else {
+      signal_state_ = --signal_state;
+    }
+    return true;
+  }
+
  private:
   using state_t_ = uint_fast32_t;
   static constexpr state_t_ SIGMASK_ = state_t_(1)

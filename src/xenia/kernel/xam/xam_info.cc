@@ -368,26 +368,26 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
 
     xam->SaveLoaderData();
 
-    if (loader_data.launch_data_present) {
-      auto display_window = kernel_state()->emulator()->display_window();
-      auto imgui_drawer = kernel_state()->emulator()->imgui_drawer();
-
-      if (display_window && imgui_drawer) {
-        display_window->app_context().CallInUIThreadSynchronous(
-            [imgui_drawer]() {
-              xe::ui::ImGuiDialog::ShowMessageBox(
-                  imgui_drawer, "Title was restarted",
-                  "Title closed with new launch data. \nPlease restart Xenia. "
-                  "Game will be loaded automatically.");
-            });
-      }
-    }
+    // Stash the continuation instead of queuing it to the UI thread here:
+    // TerminateTitle() (below) still has to step and kill every other guest
+    // thread of the outgoing title (background workers included) and unload
+    // its modules. Queuing to the UI thread now would race that teardown,
+    // since CallInUIThread() only posts the task - it does not wait for
+    // TerminateTitle() to finish. KernelState::TerminateTitle() takes and
+    // dispatches this continuation itself once teardown is actually done.
+    auto emulator = kernel_state()->emulator();
+    emulator->SetPendingLaunchContinuation(
+        [emulator]() { emulator->ContinuePendingLaunch(); });
   } else {
+    // ALL: this is "exit to dashboard" (Guide button from a game).
+    // You would need to set loader_data.launch_path to the path of your dash.xex
+    // here and enqueue the same continuation before calling
+    // TerminateTitle().
     assert_always("Game requested exit to dashboard via XamLoaderLaunchTitle");
   }
 
-  // This function does not return.
-  kernel_state()->TerminateTitle();
+  // Does not return: terminates the guest thread that made this call.
+  kernel_state()->emulator()->TerminateTitle();
 }
 DECLARE_XAM_EXPORT1(XamLoaderLaunchTitle, kNone, kSketchy);
 

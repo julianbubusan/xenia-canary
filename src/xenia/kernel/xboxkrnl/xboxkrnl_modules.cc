@@ -74,7 +74,17 @@ dword_result_t XexGetModuleSection_entry(lpvoid_t hmodule, lpstring_t name,
                                          lpdword_t size_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
 
-  auto module = XModule::GetFromHModule(kernel_state(), hmodule);
+  // A null hmodule means "the calling module itself" (same convention
+  // XexGetProcedureAddress_entry below already handles) - observed hit by
+  // bootanim.xex, which passes hmodule=0. Without this check,
+  // XModule::GetFromHModule()/GetHandleFromHModule() dereferences the null
+  // pointer directly and crashes.
+  object_ref<XModule> module;
+  if (!hmodule) {
+    module = kernel_state()->GetExecutableModule();
+  } else {
+    module = XModule::GetFromHModule(kernel_state(), hmodule);
+  }
   if (module) {
     uint32_t section_data = 0;
     uint32_t section_size = 0;

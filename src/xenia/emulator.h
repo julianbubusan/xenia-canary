@@ -234,7 +234,24 @@ class Emulator {
   X_STATUS LaunchStfsContainer(const std::filesystem::path& path);
 
   X_STATUS LaunchDefaultModule(const std::filesystem::path& path);
+  
+  // Continues a pending title transition initiated via
+  // XamLoaderLaunchTitle, without restarting the process.
+  X_STATUS ContinuePendingLaunch();
 
+  // Stashes a continuation to run once the outgoing title's guest threads
+  // have actually been torn down. Set by XamLoaderLaunchTitle before it
+  // requests termination of the current title; consumed and dispatched to
+  // the UI thread by KernelState::TerminateTitle() only after it has
+  // finished killing every other guest thread and unloading modules, so the
+  // new title never starts loading while an old background thread (e.g. one
+  // spawned by the outgoing title) is still executing.
+  void SetPendingLaunchContinuation(std::function<void()> continuation) {
+    pending_launch_continuation_ = std::move(continuation);
+  }
+  std::function<void()> TakePendingLaunchContinuation() {
+    return std::move(pending_launch_continuation_);
+  }
   enum class InstallState : uint8_t {
     preparing,
     pending,
@@ -329,6 +346,8 @@ class Emulator {
 
   std::string title_name_;
   std::string title_version_;
+
+  std::function<void()> pending_launch_continuation_;
 
   ui::Window* display_window_ = nullptr;
   ui::ImGuiDrawer* imgui_drawer_ = nullptr;

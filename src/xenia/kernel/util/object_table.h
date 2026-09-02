@@ -40,6 +40,11 @@ class ObjectTable {
   X_STATUS ReleaseHandle(X_HANDLE handle);
   X_STATUS ReleaseHandleInLock(X_HANDLE handle);
   X_STATUS RemoveHandle(X_HANDLE handle);
+  // Removes a handle unconditionally, regardless of outstanding retains.
+  // Used during full title teardown (KernelState::TerminateTitle), where
+  // objects are torn down all at once instead of following the normal
+  // refcounted release path.
+  X_STATUS ForceRemoveHandle(X_HANDLE handle);
 
   bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);

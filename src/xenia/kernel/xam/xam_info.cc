@@ -545,7 +545,7 @@ dword_result_t XamRegisterSysApp_entry(const ppc_context_t& ctx) {
           // freed object, which is exactly what crashed the previous run.
           static const uint32_t kCandidateReasons[] = {
               0x80000002, 0x80000006, 0x80000007, 0x80000008,
-              0x80000009, 0x8000000A, 0x80000010, 0x80000005,
+              0x80000009, 0x8000000A, 0x80000010,
           };
           for (uint32_t reason : kCandidateReasons) {
             xe::threading::Sleep(std::chrono::milliseconds(500));
@@ -557,6 +557,27 @@ dword_result_t XamRegisterSysApp_entry(const ppc_context_t& ctx) {
             XELOGI("TEMP DIAG: reason {:08X} returned {:08X}", reason,
                    static_cast<uint32_t>(probe_result));
           }
+
+          // 0x8000000A is the input-tick reason (XamInputGetKeystrokeHud +
+          // XuiProcessInput) - pump it repeatedly for a few seconds so a
+          // real controller button press has a chance to be observed going
+          // through, instead of a single one-shot call.
+          XELOGI("TEMP DIAG: pumping input tick (0x8000000A) x10");
+          for (int i = 0; i < 10; ++i) {
+            xe::threading::Sleep(std::chrono::milliseconds(300));
+            uint64_t input_args[] = {0x8000000A, param2_buffer, param3_buffer};
+            kernel_state()->processor()->Execute(
+                XThread::GetCurrentThread()->thread_state(), r5, input_args,
+                xe::countof(input_args));
+          }
+
+          XELOGI("TEMP DIAG: probing reason 80000005 (destroy)");
+          uint64_t destroy_args[] = {0x80000005, param2_buffer, param3_buffer};
+          uint64_t destroy_result = kernel_state()->processor()->Execute(
+              XThread::GetCurrentThread()->thread_state(), r5, destroy_args,
+              xe::countof(destroy_args));
+          XELOGI("TEMP DIAG: reason 80000005 returned {:08X}",
+                 static_cast<uint32_t>(destroy_result));
           return 0;
         },
         kernel_state()->GetSystemProcess()));

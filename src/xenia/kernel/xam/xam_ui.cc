@@ -24,6 +24,7 @@
 #include "xenia/kernel/xam/user_tracker.h"
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xam/xur_file.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/imgui_guest_notification.h"
@@ -2169,6 +2170,34 @@ void TryLogGuestWideString(const char* label, uint32_t guest_addr) {
   XELOGI("  {} ({:08X}) = \"{}\"", label, guest_addr, xe::to_utf8(str));
 }
 
+// Reads a file named `name` out of --guide_overlay_resources_path on the
+// host filesystem, if that cvar is set and the file exists there. Shared by
+// every resource-loading stub (XuiLoadStringTableFromFile, XuiSceneCreate,
+// ...) so a real console-extracted file can just be dropped into that
+// folder by its real filename and picked up automatically.
+bool TryReadHostResourceFile(const std::u16string& name,
+                             std::vector<uint8_t>* out_data) {
+  if (cvars::guide_overlay_resources_path.empty()) {
+    return false;
+  }
+  auto host_path =
+      std::filesystem::path(xe::to_path(cvars::guide_overlay_resources_path)) /
+      xe::to_path(xe::to_utf8(name));
+  std::ifstream file(host_path, std::ios::binary | std::ios::ate);
+  if (!file.is_open()) {
+    XELOGI("TryReadHostResourceFile: no host file at '{}'",
+           xe::path_to_utf8(host_path));
+    return false;
+  }
+  size_t size = static_cast<size_t>(file.tellg());
+  file.seekg(0);
+  out_data->resize(size);
+  file.read(reinterpret_cast<char*>(out_data->data()), size);
+  XELOGI("TryReadHostResourceFile: found host file '{}' ({} bytes)",
+         xe::path_to_utf8(host_path), size);
+  return true;
+}
+
 // TEMP DIAG / best-effort .xus (XUI string table) parser, reverse engineered
 // from the NGxDTV/XZP-Tool-v3 open-source XusFile.cs reader (not verified
 // against a real console-extracted .xus file yet - this is a from-docs
@@ -2380,34 +2409,19 @@ dword_result_t XuiLoadStringTableFromFile_entry(const ppc_context_t& ctx) {
   // requested name (r6, e.g. "strings.xus") exists there, parse it as a
   // diagnostic - lets a real console-extracted .xus be dropped in and
   // inspected without any guest-side wiring yet.
-  if (!cvars::guide_overlay_resources_path.empty()) {
-    uint32_t name_addr = static_cast<uint32_t>(ctx->r[6]);
-    if (name_addr) {
-      auto name = xe::load_and_swap<std::u16string>(
-          kernel_state()->memory()->TranslateVirtual(name_addr));
-      auto host_path = std::filesystem::path(
-                           xe::to_path(cvars::guide_overlay_resources_path)) /
-                       xe::to_path(xe::to_utf8(name));
-      std::ifstream file(host_path, std::ios::binary | std::ios::ate);
-      if (file.is_open()) {
-        size_t size = static_cast<size_t>(file.tellg());
-        file.seekg(0);
-        std::vector<uint8_t> data(size);
-        file.read(reinterpret_cast<char*>(data.data()), size);
-        file.close();
-        XELOGI("XuiLoadStringTableFromFile: found host file '{}' ({} bytes)",
-               xe::path_to_utf8(host_path), size);
-        std::vector<XusEntry> entries;
-        if (ParseXusFile(data, &entries)) {
-          XELOGI("XuiLoadStringTableFromFile: parsed {} entries",
-                 entries.size());
-          for (size_t i = 0; i < entries.size() && i < 20; ++i) {
-            XELOGI("  [{}] = \"{}\"", entries[i].key, entries[i].value);
-          }
+  uint32_t name_addr = static_cast<uint32_t>(ctx->r[6]);
+  if (name_addr) {
+    auto name = xe::load_and_swap<std::u16string>(
+        kernel_state()->memory()->TranslateVirtual(name_addr));
+    std::vector<uint8_t> data;
+    if (TryReadHostResourceFile(name, &data)) {
+      std::vector<XusEntry> entries;
+      if (ParseXusFile(data, &entries)) {
+        XELOGI("XuiLoadStringTableFromFile: parsed {} entries",
+               entries.size());
+        for (size_t i = 0; i < entries.size() && i < 20; ++i) {
+          XELOGI("  [{}] = \"{}\"", entries[i].key, entries[i].value);
         }
-      } else {
-        XELOGI("XuiLoadStringTableFromFile: no host file at '{}'",
-               xe::path_to_utf8(host_path));
       }
     }
   }
@@ -2421,6 +2435,38 @@ dword_result_t XuiSceneCreate_entry(const ppc_context_t& ctx) {
   TryLogGuestWideString("r4", static_cast<uint32_t>(ctx->r[4]));
   TryLogGuestWideString("r6", static_cast<uint32_t>(ctx->r[6]));
   TryLogGuestWideString("r7", static_cast<uint32_t>(ctx->r[7]));
+
+  // r4 is the real scene filename (confirmed: "GuideMain.xur" was observed
+  // here). If --guide_overlay_resources_path is set and a file by that
+  // name exists there, parse it with the real XurFile reader and log its
+  // decoded object tree - the first end-to-end test of the verified .xur
+  // object-graph format against whatever real file gets dropped in.
+  uint32_t scene_name_addr = static_cast<uint32_t>(ctx->r[4]);
+  if (scene_name_addr) {
+    auto scene_name = xe::load_and_swap<std::u16string>(
+        kernel_state()->memory()->TranslateVirtual(scene_name_addr));
+    std::vector<uint8_t> data;
+    if (TryReadHostResourceFile(scene_name, &data)) {
+      auto xur = XurFile::Parse(data);
+      if (xur) {
+        XELOGI("XuiSceneCreate: parsed .xur tree ({} strings):",
+               xur->strings().size());
+        xur->LogTree();
+
+        auto layout = ComputeXurLayout(xur->root());
+        std::vector<KernelState::GuideOverlayRect> rects;
+        rects.reserve(layout.size());
+        for (auto& r : layout) {
+          rects.push_back(
+              {r.x, r.y, r.width, r.height, r.depth, r.class_name});
+        }
+        XELOGI("XuiSceneCreate: computed {} layout rect(s) for overlay draw",
+               rects.size());
+        kernel_state()->set_guide_overlay_layout_rects(std::move(rects));
+      }
+    }
+  }
+
   // Same caveat as XuiCreateObject - hand back a real, non-null, zeroed
   // guest buffer rather than 0 so a null-check failure path isn't taken.
   // Real XUI_SCENE layout unconfirmed.
@@ -2439,6 +2485,16 @@ dword_result_t XuiSceneNavigateFirst_entry(const ppc_context_t& ctx) {
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XuiSceneNavigateFirst, kNone, kStub);
+
+dword_result_t XuiProcessInput_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiProcessInput", ctx);
+  // Called for reason 0x8000000A right after XamInputGetKeystrokeHud
+  // (confirmed via TEMP DIAG probing) - almost certainly dispatches
+  // whatever keystroke was polled to the current scene's navigation.
+  // Logging only for now; real signature unconfirmed.
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XuiProcessInput, kNone, kStub);
 
 }  // namespace xam
 }  // namespace kernel

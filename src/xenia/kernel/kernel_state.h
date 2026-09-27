@@ -239,6 +239,25 @@ class KernelState {
     guide_overlay_has_input_focus_ = has_focus;
   }
 
+  // A single flattened box from the most recently parsed .xur scene tree
+  // (see XurFile::ComputeXurLayout in xenia/kernel/xam/xur_file.h). Kept as
+  // a plain struct here (not reusing XurLayoutRect) so this core kernel
+  // header doesn't need to depend on an xam-specific one - just for the
+  // research overlay-rendering harness to pick up in EmulatorWindow.
+  struct GuideOverlayRect {
+    float x, y, width, height;
+    int depth;
+    std::string class_name;
+  };
+  std::vector<GuideOverlayRect> guide_overlay_layout_rects() const {
+    auto lock = global_critical_region_.Acquire();
+    return guide_overlay_layout_rects_;
+  }
+  void set_guide_overlay_layout_rects(std::vector<GuideOverlayRect> rects) {
+    auto lock = global_critical_region_.Acquire();
+    guide_overlay_layout_rects_ = std::move(rects);
+  }
+
   void RegisterTitleTerminateNotification(uint32_t routine, uint32_t priority);
   void RemoveTitleTerminateNotification(uint32_t routine);
 
@@ -411,6 +430,7 @@ class KernelState {
   // so TerminateTitle()'s title-teardown sweep doesn't touch them.
   std::vector<object_ref<UserModule>> system_modules_;
   std::atomic<bool> guide_overlay_has_input_focus_{false};
+  std::vector<GuideOverlayRect> guide_overlay_layout_rects_;
   std::vector<TerminateNotification> terminate_notifications_;
   uint32_t kernel_guest_globals_ = 0;
 

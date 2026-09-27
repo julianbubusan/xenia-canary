@@ -220,6 +220,83 @@ dword_result_t XamInputGetKeystrokeEx_entry(
 }
 DECLARE_XAM_EXPORT1(XamInputGetKeystrokeEx, kInput, kImplemented);
 
+// Same underlying mechanism as XamInputGetKeystroke - the "Hud" variant is
+// what hud.xex's dispatcher calls (reason 0x8000000A, confirmed via a real
+// observed call to this export) to poll input for the system UI/overlay
+// rather than the title. Delegating to the same tested input_system state
+// this early since there's no evidence yet that system-UI input needs to be
+// isolated from the title's own polling.
+//
+// Real observed call: XamInputGetKeystrokeHud(00000000, 7014FEB0, 30024000).
+// r4 (0x7014FEB0) is a stack address and r5 (0x30024000) is our own
+// param2_buffer, both pointer-shaped - not a small flags bitmask like the
+// non-Hud variant's second parameter. Treating r4 as "flags" per the
+// standard signature meant GetKeystroke's driver filter
+// (flags & driver->GetInputType()) always failed, silently returning empty
+// regardless of real input. This variant's second parameter is the
+// keystroke output pointer instead; there's no evidence of a real flags
+// argument at all, so a fixed ANYDEVICE|ANY_USER default is used.
+dword_result_t XamInputGetKeystrokeHud_entry(
+    dword_t user_index, pointer_t<X_INPUT_KEYSTROKE> keystroke) {
+  if (!keystroke) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+
+  uint32_t flags = X_INPUT_FLAG::X_INPUT_FLAG_ANYDEVICE |
+                   X_INPUT_FLAG::X_INPUT_FLAG_ANY_USER;
+  uint32_t actual_user_index = user_index;
+  if ((actual_user_index & XUserIndexAny) == XUserIndexAny) {
+    actual_user_index = 0;
+  }
+
+  auto input_system = kernel_state()->emulator()->input_system();
+  auto lock = input_system->lock();
+  auto result = input_system->GetKeystroke(actual_user_index, flags, keystroke);
+  XELOGI("TEMP DIAG: XamInputGetKeystrokeHud result={:08X} virtual_key={:04X}",
+         static_cast<uint32_t>(result),
+         result == X_ERROR_SUCCESS
+             ? static_cast<uint32_t>(keystroke->virtual_key)
+             : 0u);
+  return result;
+}
+DECLARE_XAM_EXPORT1(XamInputGetKeystrokeHud, kInput, kImplemented);
+
+dword_result_t XamInputGetKeystrokeHudEx_entry(
+    lpdword_t user_index_ptr, dword_t flags,
+    pointer_t<X_INPUT_KEYSTROKE> keystroke) {
+  if (!keystroke) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+
+  keystroke.Zero();
+
+  uint32_t user_index = *user_index_ptr;
+  auto input_system = kernel_state()->emulator()->input_system();
+  auto lock = input_system->lock();
+  if ((user_index & XUserIndexAny) == XUserIndexAny) {
+    user_index = 0;
+  }
+
+  if (flags & X_INPUT_FLAG::X_INPUT_FLAG_ANY_USER) {
+    auto result = X_ERROR_DEVICE_NOT_CONNECTED;
+    for (uint32_t i = 0; i < XUserMaxUserCount; i++) {
+      auto result = input_system->GetKeystroke(i, flags, keystroke);
+      if (result == X_ERROR_SUCCESS) {
+        *user_index_ptr = keystroke->user_index;
+        return result;
+      }
+    }
+    return result;
+  }
+
+  auto result = input_system->GetKeystroke(user_index, flags, keystroke);
+  if (XSUCCEEDED(result)) {
+    *user_index_ptr = keystroke->user_index;
+  }
+  return result;
+}
+DECLARE_XAM_EXPORT1(XamInputGetKeystrokeHudEx, kInput, kImplemented);
+
 X_HRESULT_result_t XamUserGetDeviceContext_entry(
     dword_t user_index,
     dword_t unk,  // It's set to 3 for a big button

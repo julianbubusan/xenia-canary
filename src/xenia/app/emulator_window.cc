@@ -38,6 +38,7 @@
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
@@ -205,8 +206,8 @@ namespace {
 // open question; this only proves the compositing-over-the-game half works.
 class OverlayTestDrawer : public ui::UIDrawer {
  public:
-  explicit OverlayTestDrawer(ui::ImmediateDrawer* immediate_drawer)
-      : immediate_drawer_(immediate_drawer) {}
+  OverlayTestDrawer(ui::ImmediateDrawer* immediate_drawer, Emulator* emulator)
+      : immediate_drawer_(immediate_drawer), emulator_(emulator) {}
 
   void Draw(ui::UIDrawContext& context) override {
     bool should_log = debug_frames_logged_ < 5;
@@ -242,37 +243,16 @@ class OverlayTestDrawer : public ui::UIDrawer {
       return;
     }
 
-    // Deliberately huge and fully opaque for this diagnostic pass - covers
-    // 80% of the render target so it's unmissable if it renders at all,
-    // ruling out subtle positioning/blending issues in one shot.
-    float x0 = rt_width * 0.1f;
-    float y0 = rt_height * 0.1f;
-    float x1 = rt_width * 0.9f;
-    float y1 = rt_height * 0.9f;
-    if (should_log) {
-      XELOGI("OverlayTestDrawer::Draw: rect ({}, {}) - ({}, {})", x0, y0, x1,
-             y1);
-      ++debug_frames_logged_;
+    // Pull whatever the last successfully-parsed .xur scene tree computed
+    // (see KernelState::guide_overlay_layout_rects, populated by
+    // XuiSceneCreate_entry in xam_ui.cc via XurFile::ComputeXurLayout).
+    // Falls back to the original fixed test rectangle when nothing has
+    // been parsed yet, so the earlier Phase 2-5 compositing test still
+    // works standalone.
+    std::vector<kernel::KernelState::GuideOverlayRect> rects;
+    if (emulator_ && emulator_->kernel_state()) {
+      rects = emulator_->kernel_state()->guide_overlay_layout_rects();
     }
-
-    // ABGR (matches Dear ImGui's packed vertex color convention, which
-    // ImmediateVertex::color is documented to share): fully opaque red.
-    constexpr uint32_t kColor = 0xFF0000FFu;
-
-    ui::ImmediateVertex vertices[6];
-    auto set_vertex = [&](int i, float x, float y) {
-      vertices[i].x = x;
-      vertices[i].y = y;
-      vertices[i].u = 0.5f;
-      vertices[i].v = 0.5f;
-      vertices[i].color = kColor;
-    };
-    set_vertex(0, x0, y0);
-    set_vertex(1, x1, y0);
-    set_vertex(2, x1, y1);
-    set_vertex(3, x0, y0);
-    set_vertex(4, x1, y1);
-    set_vertex(5, x0, y1);
 
     // Pass the real render target size explicitly rather than relying on
     // the documented "0 = auto, use render target pixel coordinates"
@@ -285,18 +265,93 @@ class OverlayTestDrawer : public ui::UIDrawer {
     // at the root in d3d12_immediate_drawer.cc/vulkan_immediate_drawer.cc.
     immediate_drawer_->Begin(context, rt_width, rt_height);
 
-    ui::ImmediateDrawBatch batch;
-    batch.vertices = vertices;
-    batch.vertex_count = static_cast<int>(xe::countof(vertices));
-    immediate_drawer_->BeginDrawBatch(batch);
+    // ABGR (matches Dear ImGui's packed vertex color convention, which
+    // ImmediateVertex::color is documented to share). Cycled per nesting
+    // depth so nested boxes stay visually distinguishable.
+    static constexpr uint32_t kDepthColors[] = {
+        0xFF0000FFu,  // depth 0: opaque red
+        0x8000FF00u,  // depth 1: translucent green
+        0x80FF0000u,  // depth 2: translucent blue
+        0x80FF00FFu,  // depth 3: translucent magenta
+    };
 
-    ui::ImmediateDraw draw;
-    draw.primitive_type = ui::ImmediatePrimitiveType::kTriangles;
-    draw.count = static_cast<int>(xe::countof(vertices));
-    draw.texture = white_texture_.get();
-    immediate_drawer_->Draw(draw);
+    auto draw_rect = [&](float x0, float y0, float x1, float y1,
+                         uint32_t color) {
+      ui::ImmediateVertex vertices[6];
+      auto set_vertex = [&](int i, float x, float y) {
+        vertices[i].x = x;
+        vertices[i].y = y;
+        vertices[i].u = 0.5f;
+        vertices[i].v = 0.5f;
+        vertices[i].color = color;
+      };
+      set_vertex(0, x0, y0);
+      set_vertex(1, x1, y0);
+      set_vertex(2, x1, y1);
+      set_vertex(3, x0, y0);
+      set_vertex(4, x1, y1);
+      set_vertex(5, x0, y1);
 
-    immediate_drawer_->EndDrawBatch();
+      ui::ImmediateDrawBatch batch;
+      batch.vertices = vertices;
+      batch.vertex_count = static_cast<int>(xe::countof(vertices));
+      immediate_drawer_->BeginDrawBatch(batch);
+
+      ui::ImmediateDraw draw;
+      draw.primitive_type = ui::ImmediatePrimitiveType::kTriangles;
+      draw.count = static_cast<int>(xe::countof(vertices));
+      draw.texture = white_texture_.get();
+      immediate_drawer_->Draw(draw);
+      immediate_drawer_->EndDrawBatch();
+    };
+
+    if (!rects.empty()) {
+      // rects[0] (depth 0, the root - e.g. XuiCanvas) is the scene's own
+      // "design resolution": scale everything else proportionally to the
+      // real render target size, same convention real XUI scaling uses.
+      float design_width = rects[0].width > 0 ? rects[0].width : rt_width;
+      float design_height = rects[0].height > 0 ? rects[0].height : rt_height;
+      float scale_x = rt_width / design_width;
+      float scale_y = rt_height / design_height;
+      if (should_log) {
+        XELOGI(
+            "OverlayTestDrawer::Draw: drawing {} .xur layout rect(s), "
+            "design={}x{} scale=({}, {})",
+            rects.size(), design_width, design_height, scale_x, scale_y);
+      }
+      for (auto& r : rects) {
+        float x0 = r.x * scale_x;
+        float y0 = r.y * scale_y;
+        float x1 = (r.x + r.width) * scale_x;
+        float y1 = (r.y + r.height) * scale_y;
+        uint32_t color =
+            kDepthColors[std::min<size_t>(r.depth, xe::countof(kDepthColors) - 1)];
+        if (should_log) {
+          XELOGI("  [{}] {} ({}, {}) - ({}, {})", r.depth, r.class_name, x0,
+                 y0, x1, y1);
+        }
+        draw_rect(x0, y0, x1, y1, color);
+      }
+    } else {
+      // Deliberately huge and fully opaque for this diagnostic pass -
+      // covers 80% of the render target so it's unmissable if it renders
+      // at all, ruling out subtle positioning/blending issues in one shot.
+      float x0 = rt_width * 0.1f;
+      float y0 = rt_height * 0.1f;
+      float x1 = rt_width * 0.9f;
+      float y1 = rt_height * 0.9f;
+      if (should_log) {
+        XELOGI("OverlayTestDrawer::Draw: no .xur rects yet, drawing fallback "
+               "rect ({}, {}) - ({}, {})",
+               x0, y0, x1, y1);
+      }
+      draw_rect(x0, y0, x1, y1, kDepthColors[0]);
+    }
+
+    if (should_log) {
+      ++debug_frames_logged_;
+    }
+
     immediate_drawer_->End();
     if (should_log) {
       XELOGI("OverlayTestDrawer::Draw: finished issuing draw calls");
@@ -305,6 +360,7 @@ class OverlayTestDrawer : public ui::UIDrawer {
 
  private:
   ui::ImmediateDrawer* immediate_drawer_;
+  Emulator* emulator_;
   std::unique_ptr<ui::ImmediateTexture> white_texture_;
   int debug_frames_logged_ = 0;
 };
@@ -1422,8 +1478,8 @@ void EmulatorWindow::ToggleOverlayCompositingTest() {
     XELOGE("ToggleOverlayCompositingTest: no immediate drawer available");
     return;
   }
-  overlay_test_drawer_ =
-      std::make_unique<OverlayTestDrawer>(immediate_drawer_.get());
+  overlay_test_drawer_ = std::make_unique<OverlayTestDrawer>(
+      immediate_drawer_.get(), emulator_);
   presenter->AddUIDrawerFromUIThread(overlay_test_drawer_.get(),
                                      kZOrderOverlayTest);
   XELOGI("ToggleOverlayCompositingTest: enabled");

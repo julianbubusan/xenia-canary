@@ -553,6 +553,8 @@ void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs,
 }
 
 void RtlInitializeCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
+  XELOGI("TEMP DIAG: RtlInitializeCriticalSection(cs={:08X})",
+         cs.guest_address());
   xeRtlInitializeCriticalSection(cs, cs.guest_address());
 }
 DECLARE_XBOXKRNL_EXPORT1(RtlInitializeCriticalSection, kNone, kImplemented);
@@ -594,6 +596,8 @@ static void CriticalSectionPrefetchW(const void* vp) {
 }
 
 void RtlEnterCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
+  XELOGI("TEMP DIAG: RtlEnterCriticalSection(cs={:08X})",
+         cs.guest_address());
   if (!cs.guest_address()) {
     XELOGE("Null critical section in RtlEnterCriticalSection!");
     return;

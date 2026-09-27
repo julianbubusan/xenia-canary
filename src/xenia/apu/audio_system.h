@@ -48,6 +48,16 @@ class AudioSystem {
   void UnregisterClient(size_t index);
   void SubmitFrame(size_t index, float* samples);
 
+  // Phase 5 of the Guide-overlay plan: applies a volume multiplier to every
+  // currently-registered client's AudioDriver (which already supports
+  // per-driver volume - see AudioDriver::SetVolume()). There's no
+  // per-client ownership tracking today (nothing distinguishes "the
+  // title's" clients from anyone else's), so for now this ducks/restores
+  // everything uniformly rather than singling out a specific client - the
+  // only clients that exist while there's no real overlay audio yet are
+  // the title's own anyway.
+  void SetAllClientsVolume(float volume);
+
   // Creates an independent, non-registered driver instance.
   virtual AudioDriver* CreateDriver(xe::threading::Semaphore* semaphore,
                                     uint32_t frequency, uint32_t channels,

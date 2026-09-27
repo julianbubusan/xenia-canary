@@ -21,6 +21,7 @@
 #include "xenia/ui/immediate_drawer.h"
 #include "xenia/ui/menu_item.h"
 #include "xenia/ui/presenter.h"
+#include "xenia/ui/ui_drawer.h"
 #include "xenia/ui/window.h"
 #include "xenia/ui/window_listener.h"
 #include "xenia/ui/windowed_app_context.h"
@@ -45,6 +46,10 @@ class EmulatorWindow {
     kZOrderHidInput,
     kZOrderImGui,
     kZOrderProfiler,
+    // Guide-overlay compositing proof-of-concept (see
+    // EmulatorWindow::ToggleOverlayCompositingTest) - drawn above the
+    // profiler so it's unambiguous when toggled on.
+    kZOrderOverlayTest,
     // Emulator window controls are expected to be always accessible by the
     // user, so highest-priority.
     kZOrderEmulatorWindowInput,
@@ -242,6 +247,34 @@ class EmulatorWindow {
   // another module in the same host folder, in the same window/process -
   // reuses the same XamLoaderLaunchTitle machinery a title would use.
   void ContinueToModule(const std::string& relative_path);
+  // Debug helper for the Guide-overlay groundwork (see
+  // KernelState::LoadSystemModule()): lets you pick an arbitrary host file
+  // (e.g. a dumped hud.xex) and load it into system_process without
+  // touching the running title, to manually verify it survives a title
+  // switch and its DllMain(DLL_PROCESS_ATTACH) call, if any, doesn't
+  // immediately crash.
+  void LoadSystemModuleTest();
+  // Phase 2 of the Guide-overlay plan: proves a UIDrawer can composite
+  // something on top of the running game via the existing presenter/
+  // ImmediateDrawer machinery, independent of any real guest-rendered
+  // content (see the architectural note in ToggleOverlayCompositingTest's
+  // definition about why this doesn't go through a second GraphicsSystem/
+  // CommandProcessor). Toggles a test rectangle on/off.
+  void ToggleOverlayCompositingTest();
+  // Phase 3 of the Guide-overlay plan: rising-edge-detected from a bare
+  // Guide button press in GamepadHotKeys() (independent of guest polling).
+  // Lazily loads cvars::guide_overlay_module_path if set, broadcasts
+  // kXNotificationSystemUI the same way other system UI does, and toggles
+  // the Phase 2 compositing test as a visual stand-in. Plumbing only - see
+  // the comment in its definition for what's deliberately not implemented
+  // yet.
+  void ToggleGuideOverlayTest();
+  // Diagnostic: suspends all guest threads momentarily, dumps every
+  // thread's current guest PC/call stack (via cpu::Processor's debugger
+  // introspection - the same data the in-app debugger UI uses) to the log,
+  // then resumes. For finding out exactly where a stuck guest thread
+  // (e.g. the hud.xex dispatcher call) actually is.
+  void DumpThreadDebugInfo();
   void InstallContent();
   void ExtractZarchive();
   void CreateZarchive();
@@ -286,6 +319,10 @@ class EmulatorWindow {
       display_config_game_config_load_callback_;
   // Creation may fail, in this case immediate drawer UI must not be drawn.
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
+  // Guide-overlay compositing proof-of-concept, see
+  // ToggleOverlayCompositingTest(). Concrete type is private to
+  // emulator_window.cc; only ever touched through the ui::UIDrawer base.
+  std::unique_ptr<ui::UIDrawer> overlay_test_drawer_;
 
   bool emulator_initialized_ = false;
   std::atomic<bool> disable_hotkeys_ = false;

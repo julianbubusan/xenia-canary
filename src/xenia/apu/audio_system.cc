@@ -219,6 +219,15 @@ void AudioSystem::SubmitFrame(size_t index, float* samples) {
   (clients_[index].driver)->SubmitFrame(samples);
 }
 
+void AudioSystem::SetAllClientsVolume(float volume) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (size_t i = 0; i < kMaximumClientCount; ++i) {
+    if (clients_[i].in_use && clients_[i].driver) {
+      clients_[i].driver->SetVolume(volume);
+    }
+  }
+}
+
 void AudioSystem::UnregisterClient(size_t index) {
   SCOPE_profile_cpu_f("apu");
 

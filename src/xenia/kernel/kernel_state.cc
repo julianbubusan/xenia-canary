@@ -525,6 +525,143 @@ object_ref<UserModule> KernelState::LoadUserModuleFromMemory(
   return module;
 }
 
+object_ref<UserModule> KernelState::LoadSystemModule(
+    const std::string_view path, bool call_entry) {
+  object_ref<UserModule> module;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+
+    // See if we've already loaded it.
+    for (auto& existing_module : system_modules_) {
+      if (existing_module->Matches(path)) {
+        return existing_module;
+      }
+    }
+
+    global_lock.unlock();
+
+    // Unlike LoadUserModule(), path is used as-is: a system module isn't
+    // necessarily sitting next to (or loaded relative to) whatever title
+    // happens to be running, or may be loading before any title has.
+    module = object_ref<UserModule>(new UserModule(this));
+    X_STATUS status = module->LoadFromFile(path);
+    if (XFAILED(status)) {
+      XELOGE("KernelState::LoadSystemModule: LoadFromFile failed for {}: {:08X}",
+             path, status);
+      object_table()->ReleaseHandle(module->handle());
+      return nullptr;
+    }
+
+    global_lock.lock();
+
+    // Putting into the listing automatically retains.
+    system_modules_.push_back(module);
+  }
+
+  return FinishLoadingSystemModule(module, call_entry);
+}
+
+object_ref<UserModule> KernelState::LoadSystemModuleFromMemory(
+    const std::string_view name, const void* addr, const size_t length,
+    bool call_entry) {
+  object_ref<UserModule> module;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+
+    for (auto& existing_module : system_modules_) {
+      if (existing_module->Matches(name)) {
+        return existing_module;
+      }
+    }
+
+    global_lock.unlock();
+
+    module = object_ref<UserModule>(new UserModule(this));
+    X_STATUS status = module->LoadFromMemoryNamed(name, addr, length);
+    if (XFAILED(status)) {
+      XELOGE(
+          "KernelState::LoadSystemModuleFromMemory: LoadFromMemoryNamed "
+          "failed for {}: {:08X}",
+          name, status);
+      object_table()->ReleaseHandle(module->handle());
+      return nullptr;
+    }
+
+    global_lock.lock();
+    system_modules_.push_back(module);
+  }
+
+  return FinishLoadingSystemModule(module, call_entry);
+}
+
+object_ref<UserModule> KernelState::FinishLoadingSystemModule(
+    object_ref<UserModule> module, bool call_entry) {
+  // Protect the module's own handle from KernelState::TerminateTitle()'s
+  // object_table_.PurgeAllObjects() sweep. Note this only protects the
+  // module handle itself, not any kernel objects (events, etc.) it may go
+  // on to create - those need their own SetHandleProtected() call at the
+  // point they're created, once it's known the module actually needs one.
+  object_table()->SetHandleProtected(module->handle(), true);
+
+  X_STATUS load_continue_result = module->LoadContinue();
+  if (XFAILED(load_continue_result)) {
+    XELOGE(
+        "KernelState::FinishLoadingSystemModule: LoadContinue failed for "
+        "{}: {:08X}",
+        module->name(), load_continue_result);
+    return module;
+  }
+  module->Dump();
+  if (module->xex_module()) {
+    module->xex_module()->Precompile();
+  }
+
+  XELOGI(
+      "KernelState::FinishLoadingSystemModule: {} loaded (is_dll_module={}, "
+      "entry_point={:08X}, has_synthetic_entry_point={})",
+      module->name(), module->is_dll_module(), module->entry_point(),
+      module->has_synthetic_entry_point());
+
+  if (module->is_dll_module() && module->entry_point() && call_entry &&
+      !module->has_synthetic_entry_point()) {
+    // Call DllMain(DLL_PROCESS_ATTACH), same convention
+    // FinishLoadingUserModule() uses for title-loaded DLL modules - but on a
+    // dedicated system_process host thread instead of whatever thread
+    // called this, since the intended caller (a physical Guide-button
+    // press) is host UI code with no guest thread context of its own.
+    auto attach_thread = object_ref<XHostThread>(new XHostThread(
+        this, 64 * 1024, 0,
+        [this, module]() {
+          XELOGI("System module attach thread starting for {}",
+                 module->name());
+          uint64_t args[] = {
+              module->handle(),
+              1,  // DLL_PROCESS_ATTACH
+              0,  // 0 because always dynamic
+          };
+          processor()->Execute(XThread::GetCurrentThread()->thread_state(),
+                               module->entry_point(), args,
+                               xe::countof(args));
+          XELOGI("System module attach thread finished for {}",
+                 module->name());
+          return 0;
+        },
+        GetSystemProcess()));
+    attach_thread->set_name("System Module Attach: " +
+                            std::string(module->name()));
+    attach_thread->set_can_debugger_suspend(true);
+    X_STATUS attach_status = attach_thread->Create();
+    if (XFAILED(attach_status)) {
+      XELOGE(
+          "KernelState::FinishLoadingSystemModule: failed to create attach "
+          "thread for {}: {:08X}",
+          module->name(), attach_status);
+    }
+  }
+
+  return module;
+}
+
 X_RESULT KernelState::FinishLoadingUserModule(
     const object_ref<UserModule> module, bool call_entry) {
   // TODO(Gliniak): Apply custom patches here
@@ -754,9 +891,13 @@ void KernelState::TerminateTitle() {
   terminate_notifications_.clear();
   */
 
-  // Kill all guest threads.
+  // Kill all guest threads, except ones belonging to system_process (e.g. a
+  // module loaded via LoadSystemModule() and any threads it has spun up
+  // itself) - those must survive a title switch, the same way
+  // system_modules_ is left untouched below.
   for (auto it = threads_by_id_.begin(); it != threads_by_id_.end();) {
-    if (!XThread::IsInThread(it->second) && it->second->is_guest_thread()) {
+    if (!XThread::IsInThread(it->second) && it->second->is_guest_thread() &&
+        it->second->creation_params()->guest_process != GetSystemProcess()) {
       auto thread = it->second;
 
       if (thread->is_running()) {
@@ -793,9 +934,20 @@ void KernelState::TerminateTitle() {
   object_table_.PurgeAllObjects();
 
   // Unregister all notify listeners.
+  // KNOWN GAP: this is unconditional, same as object_table_.PurgeAllObjects()
+  // used to be - if a system_process module (see LoadSystemModule()) ever
+  // registers its own XNotifyListener, it will be silently dropped here.
+  // Not yet scoped because notify listeners carry no owning-process tag
+  // (unlike threads' creation_params_.guest_process); needs the same
+  // treatment once a system module is actually observed to need one.
   notify_listeners_.clear();
 
-  // Clear the TLS map.
+  // Clear the TLS map (TlsAlloc()-style dynamic slots - not to be confused
+  // with the compiler-emitted per-thread TLS block XThread::Create() sets up
+  // per-process, see the comment there).
+  // KNOWN GAP: same as notify_listeners_ above - unconditional, and a
+  // system_process module's AllocateTLS() slots aren't tracked separately
+  // from the title's. Not yet scoped for the same reason.
   tls_bitmap_.Reset();
 
   // Unset the executable module.

@@ -224,6 +224,21 @@ class KernelState {
   uint32_t AllocateTLS();
   void FreeTLS(uint32_t slot);
 
+  // Phase 4 of the Guide-overlay plan: while true, XamInputGetState_entry()
+  // returns a neutral/zeroed state to the title instead of the real
+  // controller state, so the game doesn't react to input intended for the
+  // overlay. Set/cleared by EmulatorWindow::ToggleGuideOverlayTest()
+  // alongside the notification broadcast and compositing toggle. Doesn't
+  // affect InputSystem::GetState() itself or any host-side caller (e.g.
+  // EmulatorWindow's own hotkey polling), only this one guest syscall
+  // boundary.
+  bool guide_overlay_has_input_focus() const {
+    return guide_overlay_has_input_focus_;
+  }
+  void set_guide_overlay_has_input_focus(bool has_focus) {
+    guide_overlay_has_input_focus_ = has_focus;
+  }
+
   void RegisterTitleTerminateNotification(uint32_t routine, uint32_t priority);
   void RemoveTitleTerminateNotification(uint32_t routine);
 
@@ -243,6 +258,26 @@ class KernelState {
   object_ref<UserModule> LoadUserModuleFromMemory(const std::string_view name,
                                                   const void* addr,
                                                   const size_t length);
+  // Loads a module into system_process instead of title_process, without
+  // making it the executable module - for a module that must keep running
+  // across a title switch (e.g. the Guide-button overlay module; see
+  // TerminateTitle(), which only tears down title_process's threads/modules
+  // and leaves system_modules_ alone). Unlike LoadUserModule(), the path is
+  // used as-is (not resolved relative to the executable module, which may
+  // not exist yet or have nothing to do with where a system module lives).
+  // If the module is a DLL module with a real entry point, its
+  // DllMain(DLL_PROCESS_ATTACH) is invoked on a dedicated system_process
+  // host thread (not the calling thread, which may not be a guest thread at
+  // all - e.g. a host-side Guide-button press).
+  object_ref<UserModule> LoadSystemModule(const std::string_view path,
+                                          bool call_entry = true);
+  // Same as LoadSystemModule(), but loads from a host memory buffer instead
+  // of resolving a guest VFS path - for a system module (e.g. a dumped
+  // hud.xex) that isn't mounted anywhere in the guest filesystem, mirroring
+  // how LoadUserModuleFromMemory() relates to LoadUserModule().
+  object_ref<UserModule> LoadSystemModuleFromMemory(
+      const std::string_view name, const void* addr, const size_t length,
+      bool call_entry = true);
   X_RESULT FinishLoadingUserModule(const object_ref<UserModule> module,
                                    bool call_entry = true);
   void UnloadUserModule(const object_ref<UserModule>& module,
@@ -328,6 +363,12 @@ class KernelState {
                              uint32_t cpu);
 
  private:
+  // Shared tail end of LoadSystemModule()/LoadSystemModuleFromMemory():
+  // protects the module's handle, finishes parsing it, and DLL-attaches it
+  // on a dedicated system_process thread if applicable.
+  object_ref<UserModule> FinishLoadingSystemModule(
+      object_ref<UserModule> module, bool call_entry);
+
   void LoadKernelModule(object_ref<KernelModule> kernel_module);
   void InitializeProcess(X_KPROCESS* process, uint32_t type, char unk_18,
                          char unk_19, char unk_1A);
@@ -366,6 +407,10 @@ class KernelState {
   object_ref<UserModule> executable_module_;
   std::vector<object_ref<KernelModule>> kernel_modules_;
   std::vector<object_ref<UserModule>> user_modules_;
+  // Modules loaded via LoadSystemModule(), kept separate from user_modules_
+  // so TerminateTitle()'s title-teardown sweep doesn't touch them.
+  std::vector<object_ref<UserModule>> system_modules_;
+  std::atomic<bool> guide_overlay_has_input_focus_{false};
   std::vector<TerminateNotification> terminate_notifications_;
   uint32_t kernel_guest_globals_ = 0;
 

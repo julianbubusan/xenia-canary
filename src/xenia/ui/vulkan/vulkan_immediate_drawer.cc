@@ -247,10 +247,17 @@ void VulkanImmediateDrawer::Begin(UIDrawContext& ui_draw_context,
   viewport.maxDepth = 1.0f;
   dfn.vkCmdSetViewport(draw_command_buffer, 0, 1, &viewport);
   PushConstants::Vertex push_constants_vertex;
+  // Use the base class's accessors, not the coordinate_space_width/height
+  // parameters directly - see the identical fix and full explanation in
+  // D3D12ImmediateDrawer::Begin() (d3d12_immediate_drawer.cc). Same latent
+  // bug: ImmediateDrawer::Begin()'s 0-means-auto substitution only updates
+  // the base class's own state, not these shadowed local parameters, so
+  // using them here divides by zero for any caller relying on that
+  // documented behavior.
   push_constants_vertex.coordinate_space_size_inv[0] =
-      1.0f / coordinate_space_width;
+      1.0f / this->coordinate_space_width();
   push_constants_vertex.coordinate_space_size_inv[1] =
-      1.0f / coordinate_space_height;
+      1.0f / this->coordinate_space_height();
   dfn.vkCmdPushConstants(draw_command_buffer, pipeline_layout_,
                          VK_SHADER_STAGE_VERTEX_BIT,
                          offsetof(PushConstants, vertex),

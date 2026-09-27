@@ -12,6 +12,9 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
+#include "xenia/base/threading.h"
+#include "xenia/cpu/function.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
@@ -391,6 +394,221 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
 }
 DECLARE_XAM_EXPORT1(XamLoaderLaunchTitle, kNone, kSketchy);
 
+// Diagnostic-only for now, not a real implementation: hud.xex's
+// DllMain(DLL_PROCESS_ATTACH) calls this and nothing else before returning
+// (observed loading the real flash hud.xex via
+// KernelState::LoadSystemModule(), see the Guide-overlay plan) - this is
+// very likely the real registration mechanism a system app uses to hand XAM
+// a callback to invoke later (e.g. on a Guide-button press), which is
+// exactly the "how does it get woken up" question that plan left as
+// something that couldn't be guessed without a real dump to observe. Logging
+// the raw incoming registers here first, the same iterative
+// dump-then-adapt approach used to discover bootanim.xex's quirks, rather
+// than guessing the argument layout and getting it wrong.
+// Diagnostic helper: forces JIT translation of a guest address (independent
+// of ever executing it - cpu::Processor::ResolveFunction() translates
+// on-demand regardless of whether anything calls it) and logs its PPC
+// disassembly via XELOGD. --disassemble_functions=true builds this text but
+// nothing in the main app ever calls FunctionDebugInfo::Dump() to print it
+// (only the standalone ppc_testing_main.cc tool does) - this is the missing
+// piece, not a log-routing issue as earlier attempts assumed.
+void DumpGuestFunctionDisasm(uint32_t address) {
+  auto function = kernel_state()->processor()->ResolveFunction(address);
+  if (!function) {
+    XELOGE("DumpGuestFunctionDisasm: failed to resolve function at {:08X}",
+           address);
+    return;
+  }
+  auto guest_function = dynamic_cast<cpu::GuestFunction*>(function);
+  if (!guest_function || !guest_function->debug_info()) {
+    XELOGW(
+        "DumpGuestFunctionDisasm: no debug info for {:08X} (pass "
+        "--disassemble_functions=true)",
+        address);
+    return;
+  }
+  XELOGI("DumpGuestFunctionDisasm: dumping disassembly for {:08X}", address);
+  guest_function->debug_info()->Dump();
+}
+
+dword_result_t XamRegisterSysApp_entry(const ppc_context_t& ctx) {
+  uint32_t r3 = static_cast<uint32_t>(ctx->r[3]);
+  uint32_t r4 = static_cast<uint32_t>(ctx->r[4]);
+  uint32_t r5 = static_cast<uint32_t>(ctx->r[5]);
+  uint32_t r6 = static_cast<uint32_t>(ctx->r[6]);
+  uint32_t r7 = static_cast<uint32_t>(ctx->r[7]);
+  uint32_t r8 = static_cast<uint32_t>(ctx->r[8]);
+  uint32_t r9 = static_cast<uint32_t>(ctx->r[9]);
+  uint32_t r10 = static_cast<uint32_t>(ctx->r[10]);
+  XELOGI(
+      "XamRegisterSysApp(r3={:08X}, r4={:08X}, r5={:08X}, r6={:08X}, "
+      "r7={:08X}, r8={:08X}, r9={:08X}, r10={:08X})",
+      r3, r4, r5, r6, r7, r8, r9, r10);
+
+  // Force-translate and dump both candidate function pointers (r5, and r8
+  // since it repeats as r10 and could be a second callback) before ever
+  // running either one, so we get their real PPC disassembly regardless of
+  // whether execution later hangs or misbehaves.
+  if (r5) {
+    DumpGuestFunctionDisasm(r5);
+  }
+  if (r8 && r8 != r5) {
+    DumpGuestFunctionDisasm(r8);
+  }
+  // TEMP DIAG: also force-dump the allocator wrapper and its import thunk -
+  // the call chain reaches "bl 0x913FBEC8" inside FUN_913e64c0 but neither
+  // XamAllocEx_entry nor XamAllocImpl's own diagnostic logs ever fire,
+  // meaning whatever's stuck is between here and the syscall trap.
+  DumpGuestFunctionDisasm(0x913FBEC8);
+  DumpGuestFunctionDisasm(0x91401644);
+  // TEMP DIAG: DiagnosticLogThreadGuestState showed thread 6 crashed inside
+  // FUN_913fb948 (the reason-code/vtable dispatcher) at guest_pc=913FBA2C,
+  // which is +0xE4 into it - dump its real disassembly to see exactly what
+  // instruction is there and what it's trying to dereference.
+  DumpGuestFunctionDisasm(0x913FB948);
+  // TEMP DIAG: Ghidra's static analysis claimed FUN_913fbda4 (called as the
+  // very first thing inside FUN_913e64c0, presumably to fetch a "reason
+  // code") is just a bare blr no-op - but that was never verified against
+  // Xenia's own JIT. If it's actually an import thunk (like XamAllocEx was),
+  // our r3=handle passthrough assumption is wrong and that's the real bug.
+  DumpGuestFunctionDisasm(0x913FBDA4);
+
+  // Re-enabled with a corrected calling convention (previous attempts
+  // spawned r5 as a generic single-argument XThread entry point, but the
+  // decompiled signature - see hud_decompiled2.txt - is
+  // FUN_913e64c0(undefined8 param_1, undefined8 param_2, undefined8
+  // param_3), and param_2 gets dereferenced as a pointer immediately
+  // (puVar2[1]) with no null check. Spawning it as a 1-arg thread left
+  // param_2/param_3 as whatever garbage sat in a fresh register state
+  // (almost certainly 0), which a guest address-0 dereference would fault
+  // on - the likely real explanation for "starts, logs nothing further,
+  // sometimes freezes" seen before, not a persistent message-pump loop as
+  // first guessed.
+  //
+  // Calling it correctly instead: allocate two small zeroed guest buffers
+  // so every offset the decompiled code reads (param_2[0], param_2[1],
+  // param_2[3]; param_3[0], param_3[1], param_3[2] - see FUN_913e64c0 and
+  // FUN_913fb948) lands on valid, merely-zero-valued memory rather than an
+  // invalid address. A zeroed param_2[1] (the "puVar1" pointer) makes the
+  // dispatcher take its default/fallback screen-type branch (uVar4 == 0 ->
+  // FUN_913eccc0), which is the one branch we have a full decompile of.
+  // Executed synchronously (not spawned as a persistent thread) on a
+  // dedicated system_process host thread, the same DLL_PROCESS_ATTACH-style
+  // pattern KernelState::LoadSystemModule() already uses, since this looks
+  // like a one-shot message-handler callback rather than a thread entry
+  // point. Still an accepted-risk retest: if anything in the call chain
+  // hangs, xenia_canary.exe needs a hard kill, and whatever got logged
+  // right before is the next thing to investigate.
+  if (r5) {
+    constexpr uint32_t kArgBufferSize = 0x20;
+    uint32_t param2_buffer = kernel_state()->memory()->SystemHeapAlloc(kArgBufferSize);
+    uint32_t param3_buffer = kernel_state()->memory()->SystemHeapAlloc(kArgBufferSize);
+    if (!param2_buffer || !param3_buffer) {
+      XELOGE("XamRegisterSysApp: failed to allocate argument buffers");
+      return X_STATUS_SUCCESS;
+    }
+    kernel_state()->memory()->Fill(param2_buffer, kArgBufferSize, 0);
+    kernel_state()->memory()->Fill(param3_buffer, kArgBufferSize, 0);
+
+    XELOGI(
+        "XamRegisterSysApp: calling dispatcher at {:08X} synchronously "
+        "(handle={:08X}, param2={:08X}, param3={:08X}) on system_process",
+        r5, r3, param2_buffer, param3_buffer);
+    auto call_thread = object_ref<XHostThread>(new XHostThread(
+        kernel_state(), 64 * 1024, 0,
+        [r5, param2_buffer, param3_buffer]() {
+          XELOGI("XamRegisterSysApp dispatcher call starting");
+          // FUN_913fbda4 (the very first thing the dispatcher calls) turned
+          // out to be __savegprlr_27, a stock compiler register-spill
+          // helper - not a "get reason code" accessor. It never touches r3,
+          // which means the dispatcher's first parameter IS the reason code
+          // directly (WNDPROC-style), compared against sentinels like
+          // 0x80000004 (create). Passing our registration handle there was
+          // the actual bug - a real XAM message pump would send a create
+          // notification first, so that's what we simulate here.
+          constexpr uint32_t kReasonCreate = 0x80000004;
+          uint64_t args[] = {kReasonCreate, param2_buffer, param3_buffer};
+          uint64_t result = kernel_state()->processor()->Execute(
+              XThread::GetCurrentThread()->thread_state(), r5, args,
+              xe::countof(args));
+          XELOGI("XamRegisterSysApp dispatcher call returned {:08X}",
+                 static_cast<uint32_t>(result));
+
+          // TEMP DIAG: create succeeded - the object is alive at
+          // DAT_914028f0 and any other reason code now routes through
+          // FUN_913fb948's generic path straight to its real vtable. Probe
+          // the rest of the candidate reason codes FUN_913fb948's switch
+          // recognizes to see which (if any) drives it toward rendering.
+          // 0x80000005 turned out to be DESTROY (confirmed: it unregisters
+          // every Xui class and XamFrees the object, zeroing
+          // DAT_914028f0) - it must run LAST, or every later probe hits a
+          // freed object, which is exactly what crashed the previous run.
+          static const uint32_t kCandidateReasons[] = {
+              0x80000002, 0x80000006, 0x80000007, 0x80000008,
+              0x80000009, 0x8000000A, 0x80000010, 0x80000005,
+          };
+          for (uint32_t reason : kCandidateReasons) {
+            xe::threading::Sleep(std::chrono::milliseconds(500));
+            XELOGI("TEMP DIAG: probing reason {:08X}", reason);
+            uint64_t probe_args[] = {reason, param2_buffer, param3_buffer};
+            uint64_t probe_result = kernel_state()->processor()->Execute(
+                XThread::GetCurrentThread()->thread_state(), r5, probe_args,
+                xe::countof(probe_args));
+            XELOGI("TEMP DIAG: reason {:08X} returned {:08X}", reason,
+                   static_cast<uint32_t>(probe_result));
+          }
+          return 0;
+        },
+        kernel_state()->GetSystemProcess()));
+    call_thread->set_name("XamRegisterSysApp dispatcher call");
+    call_thread->set_can_debugger_suspend(true);
+    X_STATUS call_status = call_thread->Create();
+    if (XFAILED(call_status)) {
+      XELOGE("XamRegisterSysApp: failed to create dispatcher call thread: {:08X}",
+             call_status);
+    }
+
+    // TEMP DIAG: peek at the dispatcher object's real, live vtable a bit
+    // after the call starts, independent of whether the call thread above
+    // ever returns. FUN_913e64c0 stores the newly-constructed object at the
+    // fixed guest address DAT_914028f0 (0x914028F0) and its vtable pointer
+    // is object[0]; FUN_913fb948 calls through vtable+4 for reason 0x80000004.
+    // Reading this live (rather than from the pre-entry-point memory dump)
+    // shows whether construction actually patched in a real code address or
+    // left something bogus.
+    uint32_t call_thread_id = call_thread->thread_id();
+    auto watcher_thread = object_ref<XHostThread>(new XHostThread(
+        kernel_state(), 64 * 1024, 0,
+        [call_thread_id]() {
+          xe::threading::Sleep(std::chrono::milliseconds(1500));
+          auto memory = kernel_state()->memory();
+          uint32_t obj_ptr =
+              xe::load_and_swap<uint32_t>(memory->TranslateVirtual(0x914028F0));
+          XELOGI("TEMP DIAG WATCHER: DAT_914028f0 = {:08X}", obj_ptr);
+          if (obj_ptr) {
+            uint32_t vtable_ptr =
+                xe::load_and_swap<uint32_t>(memory->TranslateVirtual(obj_ptr));
+            uint32_t slot0 = xe::load_and_swap<uint32_t>(
+                memory->TranslateVirtual(vtable_ptr + 0));
+            uint32_t slot1 = xe::load_and_swap<uint32_t>(
+                memory->TranslateVirtual(vtable_ptr + 4));
+            XELOGI(
+                "TEMP DIAG WATCHER: vtable={:08X} slot0={:08X} slot1={:08X}",
+                vtable_ptr, slot0, slot1);
+          }
+          kernel_state()->processor()->DiagnosticLogThreadGuestState(
+              call_thread_id);
+          return 0;
+        },
+        kernel_state()->GetSystemProcess()));
+    watcher_thread->set_name("TEMP DIAG watcher");
+    watcher_thread->Create();
+  }
+
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamRegisterSysApp, kNone, kStub);
+
 void XamLoaderTerminateTitle_entry() {
   // This function does not return.
   kernel_state()->TerminateTitle();
@@ -399,6 +617,9 @@ DECLARE_XAM_EXPORT1(XamLoaderTerminateTitle, kNone, kSketchy);
 
 uint32_t XamAllocImpl(uint32_t flags, uint32_t size,
                       xe::be<uint32_t>* out_ptr) {
+  // TEMP DIAG (Guide-overlay investigation): remove once we've confirmed
+  // whether the hud.xex dispatcher call chain reaches this far.
+  XELOGI("TEMP DIAG: XamAllocImpl(flags={:08X}, size={:08X})", flags, size);
   if (flags & 0x00100000) {  // HEAP_ZERO_memory used unless this flag
     // do nothing!
     // maybe we ought to fill it with nonzero garbage, but otherwise this is a
@@ -426,6 +647,10 @@ static const unsigned short XamPhysicalProtTable[4] = {
 
 dword_result_t XamAllocEx_entry(dword_t phys_flags, dword_t flags, dword_t size,
                                 lpdword_t out_ptr, const ppc_context_t& ctx) {
+  XELOGI(
+      "TEMP DIAG: XamAllocEx(phys_flags={:08X}, flags={:08X}, size={:08X})",
+      static_cast<uint32_t>(phys_flags), static_cast<uint32_t>(flags),
+      static_cast<uint32_t>(size));
   if ((flags & 0x40000000) == 0) {
     return XamAllocImpl(flags, size, out_ptr);
   }

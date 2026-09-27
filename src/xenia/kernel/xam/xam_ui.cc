@@ -7,8 +7,12 @@
  ******************************************************************************
  */
 
+#include <fstream>
+#include <vector>
+
 #include "third_party/imgui/imgui.h"
 #include "xenia/app/profile_dialogs.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
 #include "xenia/base/system.h"
@@ -32,6 +36,13 @@
 DEFINE_bool(storage_selection_dialog, false,
             "Show storage device selection dialog when the game requests it.",
             "UI");
+
+DEFINE_string(guide_overlay_resources_path, "",
+             "Host directory to look for hud.xex resource files (strings.xus, "
+             "*.xur) in, by filename, for the hud.xex research harness. Not "
+             "part of a real resource-locator implementation - personal "
+             "research use only.",
+             "UI");
 
 DECLARE_int32(license_mask);
 
@@ -2113,6 +2124,321 @@ dword_result_t XamShowAchievementsUI_entry(dword_t user_index,
       close);
 }
 DECLARE_XAM_EXPORT1(XamShowAchievementsUI, kUserProfiles, kStub);
+
+// ============================================================================
+// XUI (Xbox 360 UI framework) - Tier 1 of the Guide-overlay plan's kernel
+// export list: the core init/render lifecycle hud.xex needs before anything
+// else in XUI can work (XuiRegisterClass/XuiSceneCreate/the element tree/
+// etc. all come later and are NOT implemented here yet).
+//
+// These are deliberately observation-first stubs, not confirmed-correct
+// implementations: we don't yet have a real call site logged for most of
+// these (the guest thread that would call them - hud.xex's XamRegisterSysApp
+// dispatcher - is intentionally not being executed right now, see the
+// comment in XamRegisterSysApp_entry in xam_info.cc for why). Each logs its
+// raw incoming registers so that whenever the dispatcher is safely
+// re-enabled, we can read real observed arguments back out of the log and
+// correct any wrong assumptions here, the same iterative approach that
+// worked for XamRegisterSysApp itself. Do not treat the argument-count/
+// pointer assumptions below as confirmed - they're best-effort from public
+// knowledge of XUI's general shape, not from a verified call site.
+namespace {
+bool xui_initialized_ = false;
+uint32_t xui_next_dc_handle_ = 1;
+
+void LogXuiCall(const char* name, const ppc_context_t& ctx) {
+  XELOGI(
+      "{}(r3={:08X}, r4={:08X}, r5={:08X}, r6={:08X}, r7={:08X}, r8={:08X})",
+      name, static_cast<uint32_t>(ctx->r[3]), static_cast<uint32_t>(ctx->r[4]),
+      static_cast<uint32_t>(ctx->r[5]), static_cast<uint32_t>(ctx->r[6]),
+      static_cast<uint32_t>(ctx->r[7]), static_cast<uint32_t>(ctx->r[8]));
+}
+
+// TEMP DIAG: guest addresses within hud.xex's own module range (913Exxxx)
+// that repeat across several XamBuildDynamicResourceLocator/
+// XuiLoadStringTableFromFile calls are plausible wide-string (UTF-16BE)
+// pointers - a resource path/name or format string. Best-effort dump, safe
+// to call on a garbage address since TranslateVirtual/load_and_swap won't
+// run off the end of guest memory.
+void TryLogGuestWideString(const char* label, uint32_t guest_addr) {
+  if (!guest_addr) {
+    return;
+  }
+  auto str = xe::load_and_swap<std::u16string>(
+      kernel_state()->memory()->TranslateVirtual(guest_addr));
+  XELOGI("  {} ({:08X}) = \"{}\"", label, guest_addr, xe::to_utf8(str));
+}
+
+// TEMP DIAG / best-effort .xus (XUI string table) parser, reverse engineered
+// from the NGxDTV/XZP-Tool-v3 open-source XusFile.cs reader (not verified
+// against a real console-extracted .xus file yet - this is a from-docs
+// implementation, written before we had a real sample to test against).
+// Format: 12-byte header - magic "XUIS" (0x58554953, a legacy
+// 0x58555300 spelling also seen), 1-byte version (must be 2), 1-byte flags
+// (bits 0-1 select key mode: 0b01=uint32 keys, 0b10=index keys, 0b00=string
+// keys), 4 bytes reserved, then a big-endian uint16 entry count. Each entry
+// is a UTF-8 nul-terminated value string, then a key in the selected mode
+// (index: no bytes/implicit; uint32: 4 bytes big-endian; string: UTF-8
+// nul-terminated).
+struct XusEntry {
+  std::string key;
+  std::string value;
+};
+
+bool ParseXusFile(const std::vector<uint8_t>& data,
+                  std::vector<XusEntry>* out_entries) {
+  if (data.size() < 12) {
+    XELOGE("ParseXusFile: file too small ({} bytes)", data.size());
+    return false;
+  }
+  uint32_t magic = (uint32_t(data[0]) << 24) | (uint32_t(data[1]) << 16) |
+                   (uint32_t(data[2]) << 8) | uint32_t(data[3]);
+  if (magic != 0x58554953 && magic != 0x58555300) {
+    XELOGE("ParseXusFile: bad magic {:08X}", magic);
+    return false;
+  }
+  uint8_t version = data[4];
+  uint8_t flags = data[5];
+  uint16_t count = (uint16_t(data[10]) << 8) | uint16_t(data[11]);
+  XELOGI("ParseXusFile: magic={:08X} version={} flags={:02X} count={}", magic,
+         version, flags, count);
+
+  enum class KeyMode { kString, kUInt32, kIndex };
+  KeyMode key_mode;
+  if ((flags & 0x02) != 0) {
+    key_mode = KeyMode::kIndex;
+  } else if ((flags & 0x01) != 0) {
+    key_mode = KeyMode::kUInt32;
+  } else {
+    key_mode = KeyMode::kString;
+  }
+
+  size_t offset = 12;
+  auto read_cstring = [&](bool* ok) -> std::string {
+    size_t start = offset;
+    while (offset < data.size() && data[offset] != 0) {
+      ++offset;
+    }
+    if (offset >= data.size()) {
+      *ok = false;
+      return "";
+    }
+    std::string result(reinterpret_cast<const char*>(&data[start]),
+                       offset - start);
+    ++offset;  // Skip the nul terminator.
+    return result;
+  };
+
+  out_entries->clear();
+  out_entries->reserve(count);
+  for (uint16_t i = 0; i < count; ++i) {
+    bool ok = true;
+    std::string value = read_cstring(&ok);
+    if (!ok) {
+      XELOGE("ParseXusFile: truncated value string at entry {}", i);
+      return false;
+    }
+    std::string key;
+    switch (key_mode) {
+      case KeyMode::kIndex:
+        key = std::to_string(i);
+        break;
+      case KeyMode::kUInt32: {
+        if (offset + 4 > data.size()) {
+          XELOGE("ParseXusFile: truncated uint32 key at entry {}", i);
+          return false;
+        }
+        uint32_t key_val = (uint32_t(data[offset]) << 24) |
+                           (uint32_t(data[offset + 1]) << 16) |
+                           (uint32_t(data[offset + 2]) << 8) |
+                           uint32_t(data[offset + 3]);
+        offset += 4;
+        key = std::to_string(key_val);
+        break;
+      }
+      case KeyMode::kString:
+        key = read_cstring(&ok);
+        if (!ok) {
+          XELOGE("ParseXusFile: truncated key string at entry {}", i);
+          return false;
+        }
+        break;
+    }
+    out_entries->push_back({std::move(key), std::move(value)});
+  }
+  return true;
+}
+}  // namespace
+
+dword_result_t XuiInit_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiInit", ctx);
+  xui_initialized_ = true;
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XuiInit, kNone, kStub);
+
+dword_result_t XuiUninit_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiUninit", ctx);
+  xui_initialized_ = false;
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XuiUninit, kNone, kStub);
+
+dword_result_t XuiRenderCreateDC_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiRenderCreateDC", ctx);
+  // Real signature unconfirmed (likely takes a device pointer and an
+  // out-param for the new DC handle) - not attempting to write an output
+  // pointer yet since we don't know which register holds it without a real
+  // observed call. Just hand back a distinguishable fake handle for now.
+  uint32_t handle = xui_next_dc_handle_++;
+  XELOGI("XuiRenderCreateDC: returning fake DC handle {:08X}", handle);
+  return handle;
+}
+DECLARE_XAM_EXPORT1(XuiRenderCreateDC, kNone, kStub);
+
+dword_result_t XuiRenderDestroyDC_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiRenderDestroyDC", ctx);
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XuiRenderDestroyDC, kNone, kStub);
+
+dword_result_t XuiRenderBegin_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiRenderBegin", ctx);
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XuiRenderBegin, kNone, kStub);
+
+dword_result_t XuiRenderEnd_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiRenderEnd", ctx);
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XuiRenderEnd, kNone, kStub);
+
+dword_result_t XuiRenderPresent_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiRenderPresent", ctx);
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XuiRenderPresent, kNone, kStub);
+
+dword_result_t XuiRenderGetBackBufferSize_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiRenderGetBackBufferSize", ctx);
+  // Real signature unconfirmed (likely an out-param SIZE-style struct
+  // pointer) - not writing to a guessed pointer without a real observed
+  // call site. Returning success only for now.
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XuiRenderGetBackBufferSize, kNone, kStub);
+
+dword_result_t XuiCreateObject_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiCreateObject", ctx);
+  // Was previously an unimplemented "undefined extern" (always returns 0),
+  // which reads as a failed allocation to hud.xex's own dispatcher - it
+  // immediately unwinds and unregisters every Xui class it just registered
+  // (confirmed via TEMP DIAG probing of reason 0x80000008). Handing back a
+  // real, non-null, zeroed guest buffer instead of 0 so that failure path
+  // isn't taken, to see how much further real construction gets. Real
+  // object layout/size unconfirmed - 0x100 bytes is a guess large enough to
+  // avoid an immediate out-of-bounds read of small header fields.
+  constexpr uint32_t kFakeObjectSize = 0x100;
+  uint32_t obj_ptr = kernel_state()->memory()->SystemHeapAlloc(kFakeObjectSize);
+  if (obj_ptr) {
+    kernel_state()->memory()->Fill(obj_ptr, kFakeObjectSize, 0);
+  }
+  XELOGI("XuiCreateObject: returning fake object {:08X}", obj_ptr);
+  return obj_ptr;
+}
+DECLARE_XAM_EXPORT1(XuiCreateObject, kNone, kStub);
+
+dword_result_t XuiElementSetBounds_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiElementSetBounds", ctx);
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XuiElementSetBounds, kNone, kStub);
+
+dword_result_t XamBuildDynamicResourceLocator_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XamBuildDynamicResourceLocator", ctx);
+  TryLogGuestWideString("r3", static_cast<uint32_t>(ctx->r[3]));
+  TryLogGuestWideString("r4", static_cast<uint32_t>(ctx->r[4]));
+  TryLogGuestWideString("r5", static_cast<uint32_t>(ctx->r[5]));
+  TryLogGuestWideString("r6", static_cast<uint32_t>(ctx->r[6]));
+  TryLogGuestWideString("r7", static_cast<uint32_t>(ctx->r[7]));
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamBuildDynamicResourceLocator, kNone, kStub);
+
+dword_result_t XuiLoadStringTableFromFile_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiLoadStringTableFromFile", ctx);
+  TryLogGuestWideString("r3", static_cast<uint32_t>(ctx->r[3]));
+  TryLogGuestWideString("r4", static_cast<uint32_t>(ctx->r[4]));
+  TryLogGuestWideString("r5", static_cast<uint32_t>(ctx->r[5]));
+  TryLogGuestWideString("r6", static_cast<uint32_t>(ctx->r[6]));
+  TryLogGuestWideString("r7", static_cast<uint32_t>(ctx->r[7]));
+  // Real signature/behavior unconfirmed - the real call still just gets
+  // logged and short-circuited to success, since we don't know what
+  // structure the caller expects filled in. But if
+  // --guide_overlay_resources_path is set and a file matching the
+  // requested name (r6, e.g. "strings.xus") exists there, parse it as a
+  // diagnostic - lets a real console-extracted .xus be dropped in and
+  // inspected without any guest-side wiring yet.
+  if (!cvars::guide_overlay_resources_path.empty()) {
+    uint32_t name_addr = static_cast<uint32_t>(ctx->r[6]);
+    if (name_addr) {
+      auto name = xe::load_and_swap<std::u16string>(
+          kernel_state()->memory()->TranslateVirtual(name_addr));
+      auto host_path = std::filesystem::path(
+                           xe::to_path(cvars::guide_overlay_resources_path)) /
+                       xe::to_path(xe::to_utf8(name));
+      std::ifstream file(host_path, std::ios::binary | std::ios::ate);
+      if (file.is_open()) {
+        size_t size = static_cast<size_t>(file.tellg());
+        file.seekg(0);
+        std::vector<uint8_t> data(size);
+        file.read(reinterpret_cast<char*>(data.data()), size);
+        file.close();
+        XELOGI("XuiLoadStringTableFromFile: found host file '{}' ({} bytes)",
+               xe::path_to_utf8(host_path), size);
+        std::vector<XusEntry> entries;
+        if (ParseXusFile(data, &entries)) {
+          XELOGI("XuiLoadStringTableFromFile: parsed {} entries",
+                 entries.size());
+          for (size_t i = 0; i < entries.size() && i < 20; ++i) {
+            XELOGI("  [{}] = \"{}\"", entries[i].key, entries[i].value);
+          }
+        }
+      } else {
+        XELOGI("XuiLoadStringTableFromFile: no host file at '{}'",
+               xe::path_to_utf8(host_path));
+      }
+    }
+  }
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XuiLoadStringTableFromFile, kNone, kStub);
+
+dword_result_t XuiSceneCreate_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiSceneCreate", ctx);
+  TryLogGuestWideString("r3", static_cast<uint32_t>(ctx->r[3]));
+  TryLogGuestWideString("r4", static_cast<uint32_t>(ctx->r[4]));
+  TryLogGuestWideString("r6", static_cast<uint32_t>(ctx->r[6]));
+  TryLogGuestWideString("r7", static_cast<uint32_t>(ctx->r[7]));
+  // Same caveat as XuiCreateObject - hand back a real, non-null, zeroed
+  // guest buffer rather than 0 so a null-check failure path isn't taken.
+  // Real XUI_SCENE layout unconfirmed.
+  constexpr uint32_t kFakeSceneSize = 0x100;
+  uint32_t scene_ptr = kernel_state()->memory()->SystemHeapAlloc(kFakeSceneSize);
+  if (scene_ptr) {
+    kernel_state()->memory()->Fill(scene_ptr, kFakeSceneSize, 0);
+  }
+  XELOGI("XuiSceneCreate: returning fake scene {:08X}", scene_ptr);
+  return scene_ptr;
+}
+DECLARE_XAM_EXPORT1(XuiSceneCreate, kNone, kStub);
+
+dword_result_t XuiSceneNavigateFirst_entry(const ppc_context_t& ctx) {
+  LogXuiCall("XuiSceneNavigateFirst", ctx);
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XuiSceneNavigateFirst, kNone, kStub);
 
 }  // namespace xam
 }  // namespace kernel

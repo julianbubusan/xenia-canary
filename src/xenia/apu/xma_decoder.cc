@@ -388,6 +388,14 @@ void XmaDecoder::Pause() {
   }
   paused_ = true;
 
+  // The worker thread only rechecks paused_ after waking from work_event_ -
+  // if it's already idle-blocked there (no audio actively decoding, the
+  // common case), it would otherwise never notice and this would hang
+  // forever. AudioSystem::Pause() wakes its own worker the same way via
+  // shutdown_event_ before waiting on its fence.
+  if (work_event_) {
+    work_event_->Set();
+  }
   pause_fence_.Wait();
 }
 

@@ -404,8 +404,16 @@ void D3D12ImmediateDrawer::Begin(UIDrawContext& ui_draw_context,
 
   command_list->SetGraphicsRootSignature(root_signature_.Get());
   float coordinate_space_size_inv[2];
-  coordinate_space_size_inv[0] = 1.0f / coordinate_space_width;
-  coordinate_space_size_inv[1] = 1.0f / coordinate_space_height;
+  // Use the base class's accessors, not the coordinate_space_width/height
+  // parameters directly: per ImmediateDrawer::Begin(), 0 or negative means
+  // "use render target pixel coordinates" and the base class substitutes
+  // the real (always-positive) size internally into its own state, but
+  // these local parameters (same names, shadowing on purpose to match the
+  // base signature) are left unmodified - using them here for the divide
+  // would compute 1.0f / 0.0f for any caller relying on that documented
+  // auto behavior, corrupting every vertex transform with no visible error.
+  coordinate_space_size_inv[0] = 1.0f / this->coordinate_space_width();
+  coordinate_space_size_inv[1] = 1.0f / this->coordinate_space_height();
   command_list->SetGraphicsRoot32BitConstants(
       UINT(RootParameter::kCoordinateSpaceSizeInv), 2,
       coordinate_space_size_inv, 0);

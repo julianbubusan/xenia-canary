@@ -9,16 +9,20 @@
 
 #include "xenia/app/emulator_window.h"
 
+#include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "third_party/imgui/imgui.h"
 #include "third_party/stb/stb_image_write.h"
 #include "third_party/tomlplusplus/toml.hpp"
+#include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
@@ -29,10 +33,12 @@
 #include "xenia/base/system.h"
 #include "xenia/base/threading.h"
 #include "xenia/cpu/processor.h"
+#include "xenia/cpu/thread_debug_info.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_state.h"
@@ -63,6 +69,19 @@ DECLARE_bool(readback_memexport);
 
 DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
             "Display");
+
+DEFINE_string(
+    guide_overlay_module_path, "",
+    "Host filesystem path to a dumped hud.xex (or equivalent system "
+    "module) to load into system_process when the physical Guide button "
+    "is pressed alone (see KernelState::LoadSystemModuleFromMemory() and "
+    "EmulatorWindow::ToggleGuideOverlayTest()). Plumbing only for now: "
+    "loads and DLL-attaches the module and broadcasts kXNotificationSystemUI "
+    "the same way other system UI does, but does not yet invoke whatever "
+    "real mechanism actually wakes the module up to render - that's still "
+    "unknown pending further reverse-engineering. Leave empty to skip "
+    "loading and only exercise the notification/compositing-test halves.",
+    "HID");
 
 DEFINE_bool(controller_hotkeys, false, "Hotkeys for Xbox and PS controllers.",
             "General");
@@ -170,6 +189,127 @@ using namespace xe::gpu;
 constexpr std::string_view kRecentlyPlayedTitlesFilename = "recent.toml";
 constexpr std::string_view kBaseTitle = "Xenia-canary";
 
+namespace {
+// Phase 2 of the Guide-overlay plan, proof of concept only: draws a solid
+// test rectangle on top of the running game via the same UIDrawer/
+// ImmediateDrawer machinery ImGui dialogs already use (see
+// ui::Presenter::AddUIDrawerFromUIThread, ui::ImmediateDrawer). This is
+// backend-agnostic (D3D12 and Vulkan both implement ImmediateDrawer) and
+// deliberately does NOT involve a second gpu::GraphicsSystem/
+// CommandProcessor: GraphicsSystem::Setup() maps the GPU register/ring-
+// buffer interface to a fixed guest address range
+// (memory_->AddVirtualMappedRange in graphics_system.cc), which is a
+// singleton mapping over the one shared guest address space - there is no
+// independent "second GPU" to give a system module on real hardware either.
+// How real hud.xex-rendered content would ever reach the screen remains an
+// open question; this only proves the compositing-over-the-game half works.
+class OverlayTestDrawer : public ui::UIDrawer {
+ public:
+  explicit OverlayTestDrawer(ui::ImmediateDrawer* immediate_drawer)
+      : immediate_drawer_(immediate_drawer) {}
+
+  void Draw(ui::UIDrawContext& context) override {
+    bool should_log = debug_frames_logged_ < 5;
+    // texture=nullptr ("solid color, no texture") is a path neither
+    // ImGuiDrawer nor MicroprofileDrawer ever actually exercises - both
+    // always bind a real texture (Microprofile deliberately samples a known
+    // white texel instead of using nullptr, per its own comment). Match
+    // that proven pattern with a real 1x1 white texture instead of trusting
+    // the untested nullptr path.
+    if (!white_texture_ && immediate_drawer_) {
+      constexpr uint8_t kWhitePixel[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+      white_texture_ = immediate_drawer_->CreateTexture(
+          1, 1, ui::ImmediateTextureFilter::kNearest, false, kWhitePixel);
+      if (should_log) {
+        XELOGI("OverlayTestDrawer::Draw: white_texture_ created={}",
+               white_texture_ != nullptr);
+      }
+    }
+    if (should_log) {
+      XELOGI("OverlayTestDrawer::Draw: called, immediate_drawer_={}",
+             immediate_drawer_ != nullptr);
+    }
+    if (!immediate_drawer_) {
+      return;
+    }
+    float rt_width = float(context.render_target_width());
+    float rt_height = float(context.render_target_height());
+    if (should_log) {
+      XELOGI("OverlayTestDrawer::Draw: render target {}x{}", rt_width,
+             rt_height);
+    }
+    if (rt_width <= 0.0f || rt_height <= 0.0f) {
+      return;
+    }
+
+    // Deliberately huge and fully opaque for this diagnostic pass - covers
+    // 80% of the render target so it's unmissable if it renders at all,
+    // ruling out subtle positioning/blending issues in one shot.
+    float x0 = rt_width * 0.1f;
+    float y0 = rt_height * 0.1f;
+    float x1 = rt_width * 0.9f;
+    float y1 = rt_height * 0.9f;
+    if (should_log) {
+      XELOGI("OverlayTestDrawer::Draw: rect ({}, {}) - ({}, {})", x0, y0, x1,
+             y1);
+      ++debug_frames_logged_;
+    }
+
+    // ABGR (matches Dear ImGui's packed vertex color convention, which
+    // ImmediateVertex::color is documented to share): fully opaque red.
+    constexpr uint32_t kColor = 0xFF0000FFu;
+
+    ui::ImmediateVertex vertices[6];
+    auto set_vertex = [&](int i, float x, float y) {
+      vertices[i].x = x;
+      vertices[i].y = y;
+      vertices[i].u = 0.5f;
+      vertices[i].v = 0.5f;
+      vertices[i].color = kColor;
+    };
+    set_vertex(0, x0, y0);
+    set_vertex(1, x1, y0);
+    set_vertex(2, x1, y1);
+    set_vertex(3, x0, y0);
+    set_vertex(4, x1, y1);
+    set_vertex(5, x0, y1);
+
+    // Pass the real render target size explicitly rather than relying on
+    // the documented "0 = auto, use render target pixel coordinates"
+    // convenience: D3D12ImmediateDrawer::Begin() has a latent bug where
+    // that fallback only updates the base ImmediateDrawer's own state, not
+    // the D3D12 subclass's local coordinate_space_width/height (shadowed
+    // parameters of the same name), which then get used unmodified as
+    // 1.0f / coordinate_space_width - i.e. 1.0f / 0.0f, corrupting every
+    // vertex transform silently (no crash, no visible output). Also fixed
+    // at the root in d3d12_immediate_drawer.cc/vulkan_immediate_drawer.cc.
+    immediate_drawer_->Begin(context, rt_width, rt_height);
+
+    ui::ImmediateDrawBatch batch;
+    batch.vertices = vertices;
+    batch.vertex_count = static_cast<int>(xe::countof(vertices));
+    immediate_drawer_->BeginDrawBatch(batch);
+
+    ui::ImmediateDraw draw;
+    draw.primitive_type = ui::ImmediatePrimitiveType::kTriangles;
+    draw.count = static_cast<int>(xe::countof(vertices));
+    draw.texture = white_texture_.get();
+    immediate_drawer_->Draw(draw);
+
+    immediate_drawer_->EndDrawBatch();
+    immediate_drawer_->End();
+    if (should_log) {
+      XELOGI("OverlayTestDrawer::Draw: finished issuing draw calls");
+    }
+  }
+
+ private:
+  ui::ImmediateDrawer* immediate_drawer_;
+  std::unique_ptr<ui::ImmediateTexture> white_texture_;
+  int debug_frames_logged_ = 0;
+};
+}  // namespace
+
 EmulatorWindow::EmulatorWindow(Emulator* emulator,
                                ui::WindowedAppContext& app_context,
                                uint32_t width, uint32_t height)
@@ -252,6 +392,13 @@ void EmulatorWindow::SetupGraphicsSystemPresenterPainting() {
 void EmulatorWindow::ShutdownGraphicsSystemPresenterPainting() {
   Profiler::SetUserIO(kZOrderProfiler, window_.get(), nullptr, nullptr);
   imgui_drawer_->SetPresenterAndImmediateDrawer(nullptr, nullptr);
+  if (overlay_test_drawer_) {
+    ui::Presenter* presenter = GetGraphicsSystemPresenter();
+    if (presenter) {
+      presenter->RemoveUIDrawerFromUIThread(overlay_test_drawer_.get());
+    }
+    overlay_test_drawer_.reset();
+  }
   immediate_drawer_.reset();
   if (window_) {
     window_->SetPresenter(nullptr);
@@ -694,6 +841,17 @@ bool EmulatorWindow::Initialize() {
     file_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "Continue to dash.xex (skip boot anim)", "",
         std::bind(&EmulatorWindow::ContinueToModule, this, "dash.xex")));
+    file_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "Load system module (Guide overlay test)...",
+        "", std::bind(&EmulatorWindow::LoadSystemModuleTest, this)));
+    file_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString,
+        "Toggle overlay compositing test (Guide overlay test)", "",
+        std::bind(&EmulatorWindow::ToggleOverlayCompositingTest, this)));
+    file_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString,
+        "Dump thread debug info (Guide overlay investigation)", "",
+        std::bind(&EmulatorWindow::DumpThreadDebugInfo, this)));
 #endif  // #ifdef DEBUG
     file_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
     file_menu->AddChild(MenuItem::Create(
@@ -1173,6 +1331,216 @@ void EmulatorWindow::ContinueToModule(const std::string& relative_path) {
   emulator->SetPendingLaunchContinuation(
       [emulator]() { emulator->ContinuePendingLaunch(); });
   emulator->TerminateTitle();
+}
+
+void EmulatorWindow::LoadSystemModuleTest() {
+  auto file_picker = xe::ui::FilePicker::Create();
+  file_picker->set_mode(ui::FilePicker::Mode::kOpen);
+  file_picker->set_type(ui::FilePicker::Type::kFile);
+  file_picker->set_multi_selection(false);
+  file_picker->set_title("Select System Module to Load (e.g. hud.xex)");
+  file_picker->set_extensions({
+      {"Xbox Executable (*.xex)", "*.xex"},
+      {"All Files (*.*)", "*.*"},
+  });
+  if (!file_picker->Show(window_.get())) {
+    return;
+  }
+  auto selected_files = file_picker->selected_files();
+  if (selected_files.empty()) {
+    return;
+  }
+  const auto& path = selected_files[0];
+
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  if (!file.is_open()) {
+    XELOGE("LoadSystemModuleTest: failed to open {}", path.string());
+    return;
+  }
+  std::streamsize size = file.tellg();
+  file.seekg(0, std::ios::beg);
+  std::vector<uint8_t> buffer(static_cast<size_t>(size));
+  if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+    XELOGE("LoadSystemModuleTest: failed to read {}", path.string());
+    return;
+  }
+
+  XELOGI("LoadSystemModuleTest: loading {} ({} bytes) into system_process",
+        path.string(), buffer.size());
+  auto module = emulator_->kernel_state()->LoadSystemModuleFromMemory(
+      path.filename().string(), buffer.data(), buffer.size());
+  if (!module) {
+    XELOGE("LoadSystemModuleTest: LoadSystemModuleFromMemory failed for {}",
+           path.string());
+    return;
+  }
+
+  // RE tooling: dump the module's already-decompressed/decrypted/relocated
+  // guest memory image to a raw .bin next to the source file, so it can be
+  // imported into a real disassembler (e.g. Ghidra, raw binary, PowerPC 32
+  // big-endian, base address = the logged base below) without needing to
+  // reimplement XEX2's LZX decompression/encryption ourselves - Xenia's own
+  // loader already did that work getting the module running in the first
+  // place.
+  auto xex_module = module->xex_module();
+  if (xex_module) {
+    uint32_t base_address = xex_module->base_address();
+    uint32_t image_size = xex_module->image_size();
+    auto* image_data = emulator_->memory()->TranslateVirtual<uint8_t*>(base_address);
+    auto dump_path = path;
+    dump_path += ".dump.bin";
+    std::ofstream dump_file(dump_path, std::ios::binary);
+    if (dump_file.is_open() && image_data && image_size) {
+      dump_file.write(reinterpret_cast<const char*>(image_data), image_size);
+      dump_file.close();
+      XELOGI(
+          "LoadSystemModuleTest: dumped decompressed image to {} "
+          "(base={:08X}, size={:08X})",
+          dump_path.string(), base_address, image_size);
+    } else {
+      XELOGE("LoadSystemModuleTest: failed to dump image to {}",
+             dump_path.string());
+    }
+  }
+}
+
+void EmulatorWindow::ToggleOverlayCompositingTest() {
+  ui::Presenter* presenter = GetGraphicsSystemPresenter();
+  if (!presenter) {
+    XELOGE("ToggleOverlayCompositingTest: no presenter available");
+    return;
+  }
+
+  if (overlay_test_drawer_) {
+    presenter->RemoveUIDrawerFromUIThread(overlay_test_drawer_.get());
+    overlay_test_drawer_.reset();
+    XELOGI("ToggleOverlayCompositingTest: disabled");
+    return;
+  }
+
+  if (!immediate_drawer_) {
+    XELOGE("ToggleOverlayCompositingTest: no immediate drawer available");
+    return;
+  }
+  overlay_test_drawer_ =
+      std::make_unique<OverlayTestDrawer>(immediate_drawer_.get());
+  presenter->AddUIDrawerFromUIThread(overlay_test_drawer_.get(),
+                                     kZOrderOverlayTest);
+  XELOGI("ToggleOverlayCompositingTest: enabled");
+}
+
+void EmulatorWindow::ToggleGuideOverlayTest() {
+  // overlay_test_drawer_'s current presence is the single source of truth
+  // for visibility (rather than a separately-tracked bool) so this stays
+  // correct even if the drawer was also toggled manually via the debug
+  // menu item in between Guide presses.
+  bool will_be_visible = !overlay_test_drawer_;
+  XELOGI("ToggleGuideOverlayTest: {}",
+        will_be_visible ? "showing" : "hiding");
+
+  if (will_be_visible && !cvars::guide_overlay_module_path.empty()) {
+    // Lazy-load: KernelState::LoadSystemModuleFromMemory() dedupes by name
+    // internally, so repeat presses across multiple show/hide cycles are
+    // cheap and don't reload.
+    std::ifstream file(cvars::guide_overlay_module_path,
+                       std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+      XELOGE("ToggleGuideOverlayTest: failed to open {}",
+             cvars::guide_overlay_module_path);
+    } else {
+      std::streamsize size = file.tellg();
+      file.seekg(0, std::ios::beg);
+      std::vector<uint8_t> buffer(static_cast<size_t>(size));
+      if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+        XELOGE("ToggleGuideOverlayTest: failed to read {}",
+               cvars::guide_overlay_module_path);
+      } else {
+        std::filesystem::path module_path(cvars::guide_overlay_module_path);
+        auto module = emulator_->kernel_state()->LoadSystemModuleFromMemory(
+            module_path.filename().string(), buffer.data(), buffer.size());
+        if (!module) {
+          XELOGE(
+              "ToggleGuideOverlayTest: LoadSystemModuleFromMemory failed "
+              "for {}",
+              cvars::guide_overlay_module_path);
+        }
+      }
+    }
+  }
+
+  // Same notification convention ToggleProfilesConfigDialog() already uses
+  // when showing/hiding a system UI element - the title keeps running and
+  // just gets notified, it isn't suspended (see the xam_ui.cc dialog
+  // precedent this whole plan is built on).
+  emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                    will_be_visible ? 1 : 0);
+
+  // Phase 4: stop the title from seeing real controller input while the
+  // overlay is up (see KernelState::guide_overlay_has_input_focus() /
+  // XamInputGetState_entry()). Does not affect this thread's own
+  // GamepadHotKeys() polling, which still needs the real state to detect
+  // the Guide press that closes the overlay again.
+  emulator_->kernel_state()->set_guide_overlay_has_input_focus(
+      will_be_visible);
+
+  // Phase 5: duck the title's audio while the overlay is up, using
+  // AudioDriver's existing per-driver volume support (AudioSystem has no
+  // per-client ownership tracking, so this ducks/restores every
+  // registered client uniformly - see SetAllClientsVolume()'s comment).
+  auto audio_system = emulator_->audio_system();
+  if (audio_system) {
+    audio_system->SetAllClientsVolume(will_be_visible ? 0.2f : 1.0f);
+  }
+
+  // Visual stand-in from Phase 2 (OverlayTestDrawer) for whatever the real
+  // overlay would eventually render - this proves the whole press-Guide ->
+  // load module -> notify -> composite chain end to end, even though the
+  // module (if loaded) isn't actually driving what's drawn yet.
+  ToggleOverlayCompositingTest();
+}
+
+void EmulatorWindow::DumpThreadDebugInfo() {
+  auto processor = emulator_->processor();
+  if (!processor) {
+    XELOGE("DumpThreadDebugInfo: no processor available");
+    return;
+  }
+  XELOGI("DumpThreadDebugInfo: pausing (suspends all threads) to sample state...");
+  processor->Pause();
+
+  auto thread_infos = processor->QueryThreadDebugInfos();
+  for (auto* info : thread_infos) {
+    const char* state_name = "?";
+    switch (info->state) {
+      case cpu::ThreadDebugInfo::State::kAlive:
+        state_name = "alive";
+        break;
+      case cpu::ThreadDebugInfo::State::kWaiting:
+        state_name = "waiting";
+        break;
+      case cpu::ThreadDebugInfo::State::kExited:
+        state_name = "exited";
+        break;
+      case cpu::ThreadDebugInfo::State::kZombie:
+        state_name = "zombie";
+        break;
+    }
+    XELOGI(
+        "DumpThreadDebugInfo: thread_id={:08X} handle={:08X} state={} "
+        "suspended={} frames={}",
+        info->thread_id, info->thread_handle, state_name, info->suspended,
+        info->frames.size());
+    for (size_t i = 0; i < info->frames.size(); ++i) {
+      const auto& frame = info->frames[i];
+      XELOGI(
+          "  frame[{}]: guest_pc={:08X} guest_function_address={:08X} "
+          "name={}",
+          i, frame.guest_pc, frame.guest_function_address, frame.name);
+    }
+  }
+
+  processor->Continue();
+  XELOGI("DumpThreadDebugInfo: done, threads resumed");
 }
 
 void EmulatorWindow::InstallContent() {
@@ -1912,6 +2280,13 @@ void EmulatorWindow::VibrateController(xe::hid::InputSystem* input_sys,
 
 void EmulatorWindow::GamepadHotKeys() {
   X_INPUT_STATE state;
+  // Guide-overlay plumbing test (see the Guide-overlay plan, Phase 3):
+  // per-user rising-edge tracking for a BARE Guide press (no other
+  // buttons - Guide+X combos are the existing hotkeys handled by
+  // ProcessControllerHotkey below). This loop already polls input on a
+  // dedicated host thread independent of whether the guest title is
+  // polling at all, which is exactly what's needed here too.
+  bool guide_was_pressed[XUserMaxUserCount] = {};
 
   constexpr std::chrono::milliseconds thread_delay(75);
 
@@ -1938,6 +2313,16 @@ void EmulatorWindow::GamepadHotKeys() {
             // Disable Vibration
             VibrateController(input_sys, user_index, false);
           }
+
+          bool guide_pressed_now =
+              !disable_hotkeys_.load() && cvars::guide_button &&
+              !IsUseNexusForGameBarEnabled() &&
+              state.gamepad.buttons == X_INPUT_GAMEPAD_GUIDE;
+          if (guide_pressed_now && !guide_was_pressed[user_index]) {
+            app_context().CallInUIThread(
+                [this]() { ToggleGuideOverlayTest(); });
+          }
+          guide_was_pressed[user_index] = guide_pressed_now;
         }
       }
 

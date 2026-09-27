@@ -85,10 +85,20 @@ class ObjectTable {
   std::vector<object_ref<XObject>> GetAllObjects();
   void PurgeAllObjects();  // Purges the object table of all guest objects
 
+  // Marks a handle as surviving PurgeAllObjects() (used by
+  // KernelState::TerminateTitle() during a title switch). Intended for
+  // objects owned by a system-process module (see
+  // KernelState::LoadSystemModule()) that must outlive the title that
+  // happened to be running when it was loaded. This is a per-handle opt-in,
+  // not a general per-object owning-process model: callers are responsible
+  // for protecting every handle a system module's objects end up holding.
+  void SetHandleProtected(X_HANDLE handle, bool is_protected);
+
  private:
   struct ObjectTableEntry {
     int handle_ref_count = 0;
     XObject* object = nullptr;
+    bool is_protected = false;
   };
   ObjectTableEntry* LookupTableInLock(X_HANDLE handle);
   ObjectTableEntry* LookupTable(X_HANDLE handle);

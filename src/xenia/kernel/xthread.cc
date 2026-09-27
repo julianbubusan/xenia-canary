@@ -301,18 +301,33 @@ X_STATUS XThread::Create() {
 
   // Allocate TLS block.
   // Games will specify a certain number of 4b slots that each thread will get.
-  xex2_opt_tls_info* tls_header = nullptr;
-  auto module = kernel_state()->GetExecutableModule();
-  if (module) {
-    module->GetOptHeader(XEX_HEADER_TLS_INFO, &tls_header);
-  }
+  // TLS layout is per-process, not always "whatever the title's executable
+  // module declares": KernelState::SetExecutableModule() populates
+  // title_process's tls_* fields from the title's XEX_HEADER_TLS_INFO, and
+  // KernelState::LoadSystemModule() does the same for system_process from a
+  // system module's own header (falling back to the boot-time default set by
+  // InitializeKernelGuestGlobals() if it has none, as hud.xex doesn't). A
+  // thread belonging to system_process (e.g. one created by a loaded system
+  // module) must use that process's own TLS layout, not the title's -
+  // resolve via creation_params_.guest_process the same way
+  // InitializeGuestObject() does, instead of always reading
+  // GetExecutableModule().
+  uint32_t owning_process_ptr = creation_params_.guest_process
+                                    ? creation_params_.guest_process
+                                    : kernel_state()->GetTitleProcess();
+  auto owning_process =
+      memory()->TranslateVirtual<X_KPROCESS*>(owning_process_ptr);
 
   constexpr uint32_t kDefaultTlsSlotCount = 1024;
   uint32_t tls_slots = kDefaultTlsSlotCount;
   uint32_t tls_extended_size = 0;
-  if (tls_header && tls_header->slot_count) {
-    tls_slots = tls_header->slot_count;
-    tls_extended_size = tls_header->data_size;
+  uint32_t tls_raw_data_address = 0;
+  uint32_t tls_raw_data_size = 0;
+  if (owning_process->tls_slot_size) {
+    tls_slots = owning_process->tls_slot_size / 4;
+    tls_extended_size = owning_process->tls_data_size;
+    tls_raw_data_address = owning_process->tls_static_data_address;
+    tls_raw_data_size = owning_process->tls_raw_data_size;
   }
 
   // Allocate both the slots and the extended data.
@@ -331,9 +346,9 @@ X_STATUS XThread::Create() {
   memory()->Fill(tls_static_address_, tls_total_size_, 0);
   if (tls_extended_size) {
     // If game has extended data, copy in the default values.
-    assert_not_zero(tls_header->raw_data_address);
-    memory()->Copy(tls_static_address_, tls_header->raw_data_address,
-                   tls_header->raw_data_size);
+    assert_not_zero(tls_raw_data_address);
+    memory()->Copy(tls_static_address_, tls_raw_data_address,
+                   tls_raw_data_size);
   }
 
   // Allocate thread state block from heap.

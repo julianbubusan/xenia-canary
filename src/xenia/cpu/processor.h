@@ -211,6 +211,13 @@ class Processor {
 
   uint8_t* AllocateFunctionTraceData(size_t size);
 
+  // TEMP DIAG: captures and logs the current guest call stack for a single
+  // thread without the normal Pause()-style precondition that
+  // execution_state_ == kRunning - that never holds when only a system
+  // module (no real title) is loaded, which isn't hud.xex's fault but made
+  // the normal debugger path unusable for this investigation.
+  void DiagnosticLogThreadGuestState(uint32_t thread_id);
+
  private:
   // Synchronously demands a debug listener.
   void DemandDebugListener();

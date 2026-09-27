@@ -895,6 +895,29 @@ void Processor::Pause() {
   DemandDebugListener();
 }
 
+void Processor::DiagnosticLogThreadGuestState(uint32_t thread_id) {
+  auto global_lock = global_critical_region_.Acquire();
+  SuspendAllThreads();
+  UpdateThreadExecutionStates();
+  auto thread_info = QueryThreadDebugInfo(thread_id);
+  if (!thread_info) {
+    XELOGI("DiagnosticLogThreadGuestState: no debug info for thread {:08X}",
+           thread_id);
+  } else {
+    XELOGI("DiagnosticLogThreadGuestState: thread {:08X} has {} frame(s)",
+           thread_id, thread_info->frames.size());
+    for (size_t i = 0; i < thread_info->frames.size(); ++i) {
+      auto& frame = thread_info->frames[i];
+      XELOGI(
+          "  frame {}: guest_pc={:08X} guest_function_address={:08X} "
+          "name={} host_pc={:016X}",
+          i, frame.guest_pc, frame.guest_function_address, frame.name,
+          frame.host_pc);
+    }
+  }
+  ResumeAllThreads();
+}
+
 void Processor::Continue() {
   auto global_lock = global_critical_region_.Acquire();
   if (execution_state_ == ExecutionState::kRunning) {

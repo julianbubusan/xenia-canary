@@ -279,10 +279,21 @@ std::vector<object_ref<XObject>> ObjectTable::GetAllObjects() {
   return results;
 }
 
+void ObjectTable::SetHandleProtected(X_HANDLE handle, bool is_protected) {
+  auto global_lock = global_critical_region_.Acquire();
+  ObjectTableEntry* entry = LookupTableInLock(TranslateHandle(handle));
+  if (entry) {
+    entry->is_protected = is_protected;
+  }
+}
+
 void ObjectTable::PurgeAllObjects() {
   auto lock = global_critical_region_.Acquire();
   for (uint32_t slot = 0; slot < table_capacity_; slot++) {
     auto& entry = table_[slot];
+    if (entry.object && entry.is_protected) {
+      continue;
+    }
     if (entry.object) {
       entry.handle_ref_count = 0;
       // Unlike RemoveHandle(), this wipes every table slot in one pass, so a

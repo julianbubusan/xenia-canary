@@ -106,6 +106,17 @@ dword_result_t XamInputGetState_entry(dword_t user_index, dword_t flags,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  // Phase 4 of the Guide-overlay plan: while the overlay has input focus,
+  // give the title a neutral/zeroed state (already memset above) instead of
+  // the real controller state, so it doesn't react to input intended for
+  // the overlay. Scoped to this one guest syscall boundary specifically so
+  // it doesn't affect InputSystem::GetState() itself or host-side callers
+  // like EmulatorWindow's own hotkey polling (which needs the real state to
+  // detect the Guide press that closes the overlay again).
+  if (kernel_state()->guide_overlay_has_input_focus()) {
+    return X_ERROR_SUCCESS;
+  }
+
   // Games call this with a NULL state ptr, probably as a query.
 
   uint32_t actual_user_index = user_index;
